@@ -195,11 +195,22 @@ void dap_server::handle_set_breakpoints_request(const protocol::SetBreakpointsRe
         }
 
         const debugger::source_breakpoint_result &result = configured[configured_index++];
-        response_breakpoints.push_back(create_source_breakpoint_response(
-            source, breakpoint.request, result.verified, result.message,
-            result.verified ? std::optional<protocol::BreakpointReason>(std::nullopt)
-                            : std::optional<protocol::BreakpointReason>(protocol::BreakpointReason::Failed),
-            result.id));
+        protocol::SourceBreakpoint placed = breakpoint.request;
+        if (result.verified)
+        {
+            placed.line = result.line;
+        }
+        std::optional<protocol::BreakpointReason> reason;
+        if (result.pending)
+        {
+            reason = protocol::BreakpointReason::Pending;
+        }
+        else if (!result.verified)
+        {
+            reason = protocol::BreakpointReason::Failed;
+        }
+        response_breakpoints.push_back(
+            create_source_breakpoint_response(source, placed, result.verified, result.message, reason, result.id));
     }
 
     protocol::SetBreakpointsResponse response;

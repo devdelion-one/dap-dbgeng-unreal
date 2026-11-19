@@ -78,10 +78,22 @@ void dap_server::queue_session_event(nlohmann::json message)
 
 void dap_server::start_waiting_for_session_event(debugger::debugger_session &session)
 {
-    std::lock_guard<std::mutex> lock(session_event_wait_gate_);
-    if (wait_loop_active_)
+    std::unique_lock<std::mutex> lock(session_event_wait_gate_);
+    if (wait_loop_active_ && !session_stop_or_exit_observed_.load())
     {
         return;
+    }
+    if (wait_loop_active_)
+    {
+        // The previous loop saw its stop and is finishing (restoring source-line
+        // stepping after a step, say). A resume that lands in that window must
+        // still get a loop, or nothing calls WaitForEvent and the target never runs.
+        lock.unlock();
+        if (wait_for_session_event_thread_.joinable())
+        {
+            wait_for_session_event_thread_.join();
+        }
+        lock.lock();
     }
     if (wait_for_session_event_thread_.joinable())
     {
@@ -95,25 +107,71 @@ void dap_server::start_waiting_for_session_event(debugger::debugger_session &ses
 
 void dap_server::wait_for_session_event_loop(debugger::debugger_session *session)
 {
-    try
+    int failures_in_a_row = 0;
+    while (debugger_session_.get() == session && !session_stop_or_exit_observed_.load())
     {
-        while (debugger_session_.get() == session && !session_stop_or_exit_observed_.load())
+        try
         {
             dispatcher_.invoke([session]() {
                 session->wait_for_event();
                 return 0;
             });
+            failures_in_a_row = 0;
             if (session_stop_or_exit_observed_.load())
             {
                 restore_source_line_stepping_if_needed(*session);
             }
+            else if (debugger_session_.get() == session)
+            {
+                // The wait returned without a stop anyone reported: let the
+                // target run on rather than leave it halted unnoticed.
+                dispatcher_.invoke([session]() {
+                    if (session->is_halted())
+                    {
+                        spdlog::debug("A wait ended halted with no stop to report; resuming.");
+                        session->continue_();
+                    }
+                    return 0;
+                });
+            }
         }
-    }
-    catch (const std::exception &exception)
-    {
-        if (debugger_session_.get() == session)
+        catch (const std::exception &exception)
         {
-            spdlog::error("Failed while waiting for a debugger session event: {}", exception.what());
+            if (debugger_session_.get() != session)
+            {
+                break;
+            }
+            // One failed wait (a deferred breakpoint that can't be resolved when a
+            // module loads, say) doesn't end the session; only repeated failures do.
+            spdlog::warn("Waiting for a debugger session event failed ({} in a row): {}", failures_in_a_row + 1,
+                         exception.what());
+            if (++failures_in_a_row >= 8)
+            {
+                spdlog::error("Giving up waiting for debugger session events: {}", exception.what());
+                break;
+            }
+            // A failed wait can leave the target halted with no stop reported (a
+            // breakpoint on a line with no code fails when its module loads).
+            // Nobody is told about that halt, so let the target run on.
+            if (!session_stop_or_exit_observed_.load())
+            {
+                try
+                {
+                    dispatcher_.invoke([session]() {
+                        if (session->is_halted())
+                        {
+                            spdlog::warn("The target was left halted after a failed wait; resuming it.");
+                            session->continue_();
+                        }
+                        return 0;
+                    });
+                }
+                catch (const std::exception &resume_error)
+                {
+                    spdlog::warn("Could not resume after a failed wait: {}", resume_error.what());
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     }
 

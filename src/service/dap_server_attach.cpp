@@ -40,7 +40,8 @@ void dap_server::handle_attach_request(const protocol::AttachRequest &request)
     const bool kernel = reader::try_get_boolean(arguments, "kernel").value_or(false);
     const bool stop_at_entry = reader::try_get_boolean(arguments, "stopAtEntry").value_or(true);
     session_configuration configuration{reader::try_get_string_list(arguments, "symbolPath"),
-                                        reader::try_get_string_list(arguments, "sources")};
+                                        reader::try_get_string_list(arguments, "sources"),
+                                        reader::try_get_string_list(arguments, "sourceModules")};
 
     std::string engine_path;
     if (!try_resolve_debugger_engine_path(engine_path_arg, engine_path))

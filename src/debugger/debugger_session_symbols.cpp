@@ -109,4 +109,51 @@ std::vector<module_info> debugger_session::get_modules()
     }
     return result;
 }
+namespace
+{
+std::string folded_path(std::string text)
+{
+    for (char &ch : text)
+    {
+        ch = ch == '/' ? '\\' : static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    return text;
+}
+} // namespace
+
+void debugger_session::set_source_modules(const std::vector<std::string> &entries)
+{
+    source_modules_.clear();
+    for (const auto &entry : entries)
+    {
+        const std::size_t equals = entry.rfind('=');
+        if (equals == std::string::npos || equals == 0 || equals + 1 >= entry.size())
+        {
+            continue;
+        }
+        std::string folder = folded_path(entry.substr(0, equals));
+        if (!folder.empty() && folder.back() != '\\')
+        {
+            folder += '\\';
+        }
+        source_modules_.emplace_back(std::move(folder), entry.substr(equals + 1));
+    }
+}
+
+std::string debugger_session::module_for_source(const std::string &path) const
+{
+    const std::string folded = folded_path(path);
+    std::size_t best = 0;
+    std::string module;
+    for (const auto &[folder, name] : source_modules_)
+    {
+        if (folder.size() > best && folded.compare(0, folder.size(), folder) == 0)
+        {
+            best = folder.size();
+            module = name;
+        }
+    }
+    return module;
+}
+
 } // namespace dap_dbgeng::debugger

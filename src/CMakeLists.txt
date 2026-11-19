@@ -17,6 +17,7 @@ add_library(dap-dbgeng-objects OBJECT
   debugger/debugger_session_symbols.cpp
   debugger/debugger_session_targets.cpp
   debugger/debugger_session_threads.cpp
+  debugger/unreal_reader.cpp
   service/dap_server.cpp
   service/dap_server_session_events.cpp
   service/dap_server_attach.cpp

@@ -149,6 +149,18 @@ std::vector<process_info> debugger_session::list_processes()
 // ---------------------------------------------------------------------------
 // Targets
 // ---------------------------------------------------------------------------
+void debugger_session::keep_program_if_debugger_exits()
+{
+    // Windows ends a debugged program when its debugger exits. With this the
+    // program is detached instead, so a crashed or killed adapter never takes
+    // the program (and its unsaved work) with it.
+    const HRESULT hr = client_->AddProcessOptions(DEBUG_PROCESS_DETACH_ON_EXIT);
+    if (FAILED(hr))
+    {
+        spdlog::warn("Could not set detach-on-exit: 0x{:08X}", static_cast<std::uint32_t>(hr));
+    }
+}
+
 void debugger_session::launch(const std::string &executable_path, std::optional<std::string> arguments,
                               std::optional<std::string> working_directory)
 {
@@ -156,7 +168,7 @@ void debugger_session::launch(const std::string &executable_path, std::optional<
     throw_if_null_or_whitespace(executable_path, "executablePath");
 
     DEBUG_CREATE_PROCESS_OPTIONS options{};
-    options.CreateFlags = DEBUG_ONLY_THIS_PROCESS;
+    options.CreateFlags = DEBUG_ONLY_THIS_PROCESS | CREATE_NEW_CONSOLE;
 
     std::string resolved_working_dir;
     if (working_directory && !trim_both(*working_directory).empty())
@@ -176,6 +188,7 @@ void debugger_session::launch(const std::string &executable_path, std::optional<
                                               resolved_working_dir.c_str(), nullptr, 0, DEBUG_ATTACH_DEFAULT),
              "Could not launch target");
     wait_for_event();
+    keep_program_if_debugger_exits();
 }
 
 void debugger_session::launch_remote(const std::string &connection_string, const std::string &executable_path,
@@ -187,7 +200,7 @@ void debugger_session::launch_remote(const std::string &connection_string, const
     connect_process_server(connection_string);
 
     DEBUG_CREATE_PROCESS_OPTIONS options{};
-    options.CreateFlags = DEBUG_ONLY_THIS_PROCESS;
+    options.CreateFlags = DEBUG_ONLY_THIS_PROCESS | CREATE_NEW_CONSOLE;
 
     // executable_path and cwd are paths on the process-server host; with no cwd
     // the engine defaults it there, so nothing is resolved locally.
@@ -212,7 +225,26 @@ void debugger_session::attach(int process_id)
     // process_server_handle_ is 0 unless a process server was connected, which
     // is exactly what a local attach needs.
     attach_process_native(process_server_handle_, process_id);
+    // The create-process event comes first and the session breaks there, before
+    // Windows has announced the process's modules. Run on to the attach's own
+    // break-in, which arrives after every module load, so the stop the user sees
+    // has the whole module list (and a stack with names, not bare addresses).
     wait_for_event();
+    keep_program_if_debugger_exits();
+    {
+        ULONG loaded = 0, unloaded = 0;
+        symbols_->GetNumberModules(&loaded, &unloaded);
+        spdlog::debug("attach: first event done, {} modules", loaded);
+    }
+    attach_break_pending_.store(true);
+    execute_debugger_command("g", "Could not run to the attach break-in");
+    wait_for_event();
+    attach_break_pending_.store(false);
+    {
+        ULONG loaded = 0, unloaded = 0;
+        symbols_->GetNumberModules(&loaded, &unloaded);
+        spdlog::debug("attach: second wait done, {} modules", loaded);
+    }
 }
 
 std::optional<std::uint32_t> debugger_session::try_find_process_id_by_executable_name(

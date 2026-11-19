@@ -50,14 +50,6 @@ void dap_server::handle_evaluate_request(const protocol::EvaluateRequest &reques
         context = it->second;
     }
 
-    if (arguments.context == protocol::EvaluateArgumentsContext::Hover)
-    {
-        protocol::EvaluateResponse response;
-        response.body.result = std::string{};
-        response.body.variables_reference = 0;
-        send_response(request.seq, request.command, std::move(response));
-        return;
-    }
 
     if (is_execution_running_.load())
     {
@@ -82,11 +74,13 @@ void dap_server::handle_evaluate_request(const protocol::EvaluateRequest &reques
     // commands typed into the Watch pane keep working.
     const bool prefer_expression =
         context.has_value() && (arguments.context == protocol::EvaluateArgumentsContext::Watch ||
+                                arguments.context == protocol::EvaluateArgumentsContext::Hover ||
                                 arguments.context == protocol::EvaluateArgumentsContext::Clipboard);
 
     debugger::debugger_session &session = require_debugger_session();
     try
     {
+        std::string lazy_expression;
         const std::string result = dispatcher_.invoke([&]() -> std::string {
             if (!context.has_value())
             {
@@ -102,13 +96,32 @@ void dap_server::handle_evaluate_request(const protocol::EvaluateRequest &reques
                 {
                     try
                     {
-                        output = session.get_local_value(context->frame_number, expression).value;
+                        std::string target = expression;
+                        if (arguments.context == protocol::EvaluateArgumentsContext::Hover)
+                        {
+                            const auto hover = session.hover_expression(context->frame_number, expression);
+                            if (!hover.has_value())
+                            {
+                                throw std::runtime_error("not a local or a member here");
+                            }
+                            target = *hover;
+                        }
+                        const debugger::variable_node node = session.get_local_value(context->frame_number, target);
+                        output = node.value;
+                        lazy_expression = node.lazy_expression;
                         resolved = true;
                     }
                     catch (const std::exception &)
                     {
                         // Fall through to command execution.
                     }
+                }
+                if (!resolved && arguments.context == protocol::EvaluateArgumentsContext::Hover)
+                {
+                    // A hover is never run as a debugger command: hovering "g"
+                    // must not resume the program.
+                    session.set_current_thread(original_thread_id);
+                    return std::string{};
                 }
                 if (!resolved)
                 {
@@ -128,6 +141,13 @@ void dap_server::handle_evaluate_request(const protocol::EvaluateRequest &reques
         protocol::EvaluateResponse response;
         response.body.result = (result.empty() || util::is_blank(result)) ? "(no output)" : result;
         response.body.variables_reference = 0;
+        if (!lazy_expression.empty() && context.has_value())
+        {
+            frame_context frame;
+            frame.thread_id = context->thread_id;
+            frame.frame_number = context->frame_number;
+            response.body.variables_reference = create_lazy_variables_reference(frame, lazy_expression, expression);
+        }
         send_response(request.seq, request.command, std::move(response));
     }
     catch (const std::exception &exception)

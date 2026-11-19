@@ -1,6 +1,7 @@
 #pragma once
 
 #include "debugger/debugger_types.h"
+#include "debugger/unreal_reader.h"
 
 namespace dap_dbgeng::debugger
 {
@@ -33,6 +34,12 @@ class debugger_session
     std::function<void()> on_thread_started;
     std::function<void()> on_thread_exited;
     std::function<void(const std::string &)> on_output_received;
+    // A waiting line breakpoint was bound when its module loaded (verified, and
+    // the line it landed on), or could not be (with the reason).
+    std::function<void(int id, bool verified, int line, const std::string &message)> on_breakpoint_bound;
+
+    // Bind the waiting line breakpoints of a module that just loaded.
+    void bind_pending_breakpoints(const std::string &module_name, const std::string &image_name);
 
     // Process server (dbgsrv) -------------------------------------------------
     void connect_process_server(const std::string &connection_string);
@@ -116,11 +123,25 @@ class debugger_session
 
     // Threads -----------------------------------------------------------------
     std::vector<std::uint32_t> get_thread_ids();
+    // The children of a lazily expanded node: its expression's members (or,
+    // for an Unreal value, what the reader shows), one level, each child again
+    // lazy. "raw:" in front skips the reader.
+    std::vector<variable_node> expand_expression(std::uint32_t frame_number, const std::string &expression);
+    // What a hovered word means in this frame: a local as it is, a member of
+    // `this` as "this->Name", anything else nothing (a hover never makes the
+    // engine search every module's globals, which takes seconds).
+    std::optional<std::string> hover_expression(std::uint32_t frame_number, const std::string &expression);
     std::uint32_t get_current_thread_id();
     void set_current_thread(std::uint32_t system_thread_id);
 
     // Symbols / source --------------------------------------------------------
     void set_symbol_path(const std::vector<std::string> &symbol_paths);
+    // "<source folder>=<module>" entries: a source breakpoint under the folder is
+    // set as module!`file:line`, so the engine looks for it in that module only
+    // instead of reading every loaded module's symbols.
+    void set_source_modules(const std::vector<std::string> &entries);
+    bool is_halted();
+    std::string module_for_source(const std::string &path) const;
     void set_source_path(const std::vector<std::string> &source_paths);
     void enable_source_line_support();
     void enable_source_line_stepping();
@@ -151,6 +172,9 @@ class debugger_session
     void detach_current_process();
     void detach_all_processes();
     void terminate_current_process();
+    // Ending the session ends the program only after this; otherwise the
+    // adapter detaches, so a client that goes away never kills the program.
+    void request_terminate_on_dispose() { terminate_requested_ = true; }
 
     // Props -------------------------------------------------------------------
     bool is_kernel() const
@@ -193,6 +217,25 @@ class debugger_session
     std::uint32_t get_last_breakpoint_id();
     std::vector<int> get_configured_breakpoint_ids();
     void clear_source_breakpoints(const std::string &normalized_path);
+
+    // Line breakpoints in a mapped module (sourceModules) are resolved here, not
+    // with dbgeng's deferred `bu`: a line with no code moves to the next line
+    // that has code, and one whose module isn't loaded yet is a disabled
+    // placeholder until the module loads.
+    struct pending_line_breakpoint
+    {
+        int id = 0;
+        std::string module;
+        std::string file_name;
+        int line = 0;
+    };
+    bool is_module_loaded(const std::string &module);
+    std::optional<std::pair<int, ULONG64>> resolve_source_line(const std::string &module,
+                                                               const std::string &file_name, int line);
+    int add_code_breakpoint(std::optional<ULONG64> offset);
+    source_breakpoint_result set_module_line_breakpoint(const std::string &module, const std::string &file_name,
+                                                        int line, std::vector<int> &configured_ids);
+    std::vector<pending_line_breakpoint> pending_line_breakpoints_;
     // Replace-all helper shared by the function/instruction/data breakpoint
     // setters: clears `tracked_ids`, runs one engine command per breakpoint
     // (id-diffing to learn the new id), and re-fills `tracked_ids`.
@@ -219,6 +262,16 @@ class debugger_session
     HMODULE dbghelp_module_ = nullptr;
     IDebugClient5 *client_ = nullptr;
     IDebugControl7 *control_ = nullptr;
+    std::unique_ptr<unreal_reader> unreal_reader_;
+    // Reads a symbol-group entry through the Unreal reader: replaces the value
+    // text, and notes children to show instead of the raw members.
+    void apply_unreal_view(IDebugSymbolGroup2 *group, ULONG index, variable_node &node, bool summarize = true);
+    // A node for one of the reader's children (an array item), read straight
+    // from memory: no symbol group, so a hundred items cost almost nothing.
+    variable_node node_from_reader_child(const unreal_child &child);
+    // Walks a linked tree and turns noted reader children into real nodes, the
+    // raw members moving under "[Raw View]".
+    void expand_reader_children(variable_node &node);
     IDebugSymbols3 *symbols_ = nullptr;
     IDebugSystemObjects *system_objects_ = nullptr;
     IDebugRegisters2 *registers_ = nullptr;
@@ -229,6 +282,8 @@ class debugger_session
 
     bool disposed_ = false;
     bool terminate_debuggee_on_dispose_ = true;
+    bool terminate_requested_ = false;
+    void keep_program_if_debugger_exits();
     bool is_kernel_ = false;
     std::uint64_t process_server_handle_ = 0;
 
@@ -253,5 +308,13 @@ class debugger_session
     // Mirrors the sxe/sxd e06d7363 filter so the exception callback lets
     // first-chance C++ exceptions run when the filter is off.
     bool cpp_first_chance_break_ = false;
+    // Armed by interrupt() (a pause, or a break-in to apply breakpoints while
+    // running), cleared by every resume. A break in ntdll!DbgBreakPoint stops
+    // only while armed; one trailing after a resume is the injected break-in
+    // thread arriving late and is swallowed.
+    std::atomic<bool> expect_break_in_{false};
+    // True while attach() runs on to its own break-in.
+    std::atomic<bool> attach_break_pending_{false};
+    std::vector<std::pair<std::string, std::string>> source_modules_;
 };
 } // namespace dap_dbgeng::debugger

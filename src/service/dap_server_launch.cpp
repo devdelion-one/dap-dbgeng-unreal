@@ -29,7 +29,8 @@ void dap_server::handle_launch_request(const protocol::LaunchRequest &request)
     const std::optional<std::string> connection_string = reader::try_get_string(arguments, "connectionString");
     const bool stop_at_entry = reader::try_get_boolean(arguments, "stopAtEntry").value_or(false);
     session_configuration configuration{reader::try_get_string_list(arguments, "symbolPath"),
-                                        reader::try_get_string_list(arguments, "sources")};
+                                        reader::try_get_string_list(arguments, "sources"),
+                                        reader::try_get_string_list(arguments, "sourceModules")};
 
     if (util::is_blank(executable_path))
     {

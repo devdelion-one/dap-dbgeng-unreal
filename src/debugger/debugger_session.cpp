@@ -69,7 +69,7 @@ class debugger_session::event_callbacks : public IDebugEventCallbacks
     // IDebugEventCallbacks -------------------------------------------------
     STDMETHOD(GetInterestMask)(PULONG mask) override
     {
-        *mask = DEBUG_EVENT_BREAKPOINT | DEBUG_EVENT_CHANGE_ENGINE_STATE | DEBUG_EVENT_CREATE_PROCESS |
+        *mask = DEBUG_EVENT_BREAKPOINT | DEBUG_EVENT_CHANGE_ENGINE_STATE | DEBUG_EVENT_CREATE_PROCESS | DEBUG_EVENT_LOAD_MODULE |
                 DEBUG_EVENT_CREATE_THREAD | DEBUG_EVENT_EXCEPTION | DEBUG_EVENT_EXIT_PROCESS | DEBUG_EVENT_EXIT_THREAD |
                 DEBUG_EVENT_SESSION_STATUS | DEBUG_EVENT_SYSTEM_ERROR;
         return S_OK;
@@ -97,6 +97,51 @@ class debugger_session::event_callbacks : public IDebugEventCallbacks
         if (first_chance != 0 && exception->ExceptionCode == 0xE06D7363u && !owner_->cpp_first_chance_break_)
         {
             return DEBUG_STATUS_NO_CHANGE;
+        }
+        // The MSVC "set thread name" exception (0x406D1388) is a message to the
+        // debugger, raised inside the program's own __try/__except. Unreal
+        // raises it for every thread it creates; stopping on it stalls startup.
+        if (exception->ExceptionCode == 0x406D1388u)
+        {
+            return DEBUG_STATUS_GO_NOT_HANDLED;
+        }
+        // The break-in thread a process attach injects lands in
+        // ntdll!DbgBreakPoint; the attach stop is already reported, so a late
+        // second one is noise. A __debugbreak in the program's own code (an
+        // Unreal ensure(), say) is elsewhere and still stops.
+        if (exception->ExceptionCode == 0x80000003u)
+        {
+            ULONG64 dbg_break = 0;
+            const HRESULT found = owner_->symbols_ != nullptr
+                                      ? owner_->symbols_->GetOffsetByName("ntdll!DbgBreakPoint", &dbg_break)
+                                      : E_FAIL;
+            spdlog::debug("break exception at 0x{:x} first={} DbgBreakPoint=0x{:x} (hr 0x{:08x}) attach_pending={} expect={}",
+                         exception->ExceptionAddress, first_chance, dbg_break, static_cast<std::uint32_t>(found),
+                         owner_->attach_break_pending_.load(), owner_->expect_break_in_.load());
+        }
+        if (exception->ExceptionCode == 0x80000003u && first_chance != 0 && owner_->attach_break_pending_.exchange(false))
+        {
+            return DEBUG_STATUS_BREAK;
+        }
+        if (exception->ExceptionCode == 0x80000003u && first_chance != 0 && owner_->symbols_ != nullptr)
+        {
+            ULONG64 break_point = 0;
+            if (SUCCEEDED(owner_->symbols_->GetOffsetByName("ntdll!DbgBreakPoint", &break_point)) &&
+                break_point != 0 && exception->ExceptionAddress == break_point &&
+                !owner_->expect_break_in_.exchange(false))
+            {
+                return DEBUG_STATUS_GO_HANDLED;
+            }
+        }
+        // Any other first-chance exception goes back to the program, which may
+        // handle it (Windows' own code and drivers do this routinely). A crash
+        // is the second chance and stops. Breakpoint and single-step events
+        // are the engine's own and keep their default handling.
+        if (first_chance != 0 && exception->ExceptionCode != 0xE06D7363u && exception->ExceptionCode != 0x80000003u &&
+            exception->ExceptionCode != 0x80000004u && exception->ExceptionCode != 0x4000001Fu &&
+            exception->ExceptionCode != 0x4000001Eu)
+        {
+            return DEBUG_STATUS_GO_NOT_HANDLED;
         }
         // Remember the event so an exceptionInfo request can describe the
         // stop. Set on the dispatcher thread (inside WaitForEvent), read
@@ -167,10 +212,16 @@ class debugger_session::event_callbacks : public IDebugEventCallbacks
         (void)image_file_handle;
         (void)base_offset;
         (void)module_size;
-        (void)module_name;
-        (void)image_name;
         (void)check_sum;
         (void)time_date_stamp;
+        try
+        {
+            owner_->bind_pending_breakpoints(module_name != nullptr ? module_name : "",
+                                             image_name != nullptr ? image_name : "");
+        }
+        catch (...)
+        {
+        }
         return DEBUG_STATUS_NO_CHANGE;
     }
 
@@ -366,6 +417,7 @@ debugger_session::debugger_session(const std::string &engine_path)
     }
     base_client->Release();
     check_hr(hr, "Could not query the debug engine interfaces");
+    unreal_reader_ = std::make_unique<unreal_reader>(symbols_, data_spaces_, control_);
 
     event_callbacks_ = new event_callbacks(this);   // ref count starts at 1
     output_callbacks_ = new output_callbacks(this); // ref count starts at 1
@@ -388,7 +440,20 @@ debugger_session::~debugger_session()
 
     if (terminate_debuggee_on_dispose_ && client_ != nullptr)
     {
-        client_->EndSession(DEBUG_END_ACTIVE_TERMINATE);
+        if (terminate_requested_)
+        {
+            client_->EndSession(DEBUG_END_ACTIVE_TERMINATE);
+        }
+        else
+        {
+            try
+            {
+                detach_current_process();
+            }
+            catch (...)
+            {
+            }
+        }
     }
 
     try

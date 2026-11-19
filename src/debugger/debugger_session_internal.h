@@ -42,6 +42,7 @@ constexpr ULONG kDebugScopeGroupAll = DEBUG_SCOPE_GROUP_ALL;
 constexpr int kMaxExpansionDepth = 3;
 constexpr std::size_t kMaxExpandedNodes = 4096;
 
+
 // DEBUG_SYMBOL_PARAMETERS::ParentSymbol for a top-level (unparented) symbol.
 constexpr ULONG kDebugAnyId = DEBUG_ANY_ID;
 

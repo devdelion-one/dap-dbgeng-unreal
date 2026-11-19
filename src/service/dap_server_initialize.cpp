@@ -20,7 +20,7 @@ void dap_server::handle_initialize_request(const protocol::InitializeRequest &re
     capabilities.supports_delayed_stack_trace_loading = true;
     capabilities.supports_disassemble_request = true;
     // Hover evaluation must remain side-effect free, but the adapter forwards arbitrary WinDbg commands.
-    capabilities.supports_evaluate_for_hovers = false;
+    capabilities.supports_evaluate_for_hovers = true;
     capabilities.supports_exception_info_request = true;
     capabilities.supports_function_breakpoints = true;
     capabilities.supports_hit_conditional_breakpoints = false;

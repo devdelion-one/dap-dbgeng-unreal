@@ -145,6 +145,7 @@ class dap_server : public protocol::dap_service
     {
         std::optional<std::vector<std::string>> symbol_path;
         std::optional<std::vector<std::string>> source_path;
+        std::optional<std::vector<std::string>> source_modules;
     };
     debugger::debugger_session &create_debugger_session(const std::string &engine_path);
     void dispose_debugger_session();
@@ -258,7 +259,13 @@ class dap_server : public protocol::dap_service
         std::uint32_t frame_number = 0;
         variable_container_kind kind = variable_container_kind::locals;
         std::vector<protocol::Variable> variables;
+        // Set for a node whose children are built only when it is opened.
+        std::string lazy_expression;
+        std::string lazy_evaluate_name;
+        bool resolved = true;
     };
+    int create_lazy_variables_reference(const frame_context &context, const std::string &expression,
+                                        const std::string &evaluate_name);
     void register_frames(int thread_id, const std::vector<debugger::stack_frame_info> &frames);
     int create_variables_reference(const frame_context &context, variable_container_kind kind,
                                    const std::vector<protocol::Variable> &variables);

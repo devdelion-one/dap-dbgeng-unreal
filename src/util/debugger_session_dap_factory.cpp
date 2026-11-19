@@ -31,9 +31,31 @@ std::vector<protocol::Thread> create_threads(const std::vector<std::uint32_t> &t
         const int dap_thread_id = checked_to_int(thread_id);
         protocol::Thread thread;
         thread.id = dap_thread_id;
-        thread.name = (current_thread_id.has_value() && *current_thread_id == dap_thread_id)
-                          ? fmt::format("Thread {} (current)", thread_id)
-                          : fmt::format("Thread {}", thread_id);
+        // The program's own name for the thread (SetThreadDescription; Unreal names
+        // GameThread, RenderThread, its workers...). Local live targets only: a
+        // dump or a remote target falls back to the bare id.
+        std::string label = fmt::format("Thread {}", thread_id);
+        if (HANDLE handle = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, thread_id); handle != nullptr)
+        {
+            PWSTR description = nullptr;
+            if (SUCCEEDED(GetThreadDescription(handle, &description)) && description != nullptr && description[0] != L'\0')
+            {
+                const int bytes = WideCharToMultiByte(CP_UTF8, 0, description, -1, nullptr, 0, nullptr, nullptr);
+                if (bytes > 1)
+                {
+                    std::string name(static_cast<std::size_t>(bytes - 1), '\0');
+                    WideCharToMultiByte(CP_UTF8, 0, description, -1, name.data(), bytes, nullptr, nullptr);
+                    label = fmt::format("{} ({})", name, thread_id);
+                }
+            }
+            if (description != nullptr)
+            {
+                LocalFree(description);
+            }
+            CloseHandle(handle);
+        }
+        thread.name = (current_thread_id.has_value() && *current_thread_id == dap_thread_id) ? label + " (current)"
+                                                                                               : label;
         threads.push_back(std::move(thread));
     }
     return threads;

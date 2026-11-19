@@ -1,4 +1,28 @@
-# dap-dbgeng
+# dap-dbgeng (Unreal fork)
+
+> **This is a fork of [svnscha/dap-dbgeng](https://github.com/svnscha/dap-dbgeng)** (v0.3.0), made for the
+> debugger in Amethyst. It keeps the MIT licence and the original
+> copyright. What it changes, all checked against Unreal Engine 5.7:
+>
+> - **Unreal Editor starts and runs under it.** First-chance exceptions and Unreal's thread-name signal go back to the
+>   program instead of stopping it, and only a break-in the client asked for stops.
+> - **The program survives its debugger.** It detaches when the adapter exits (`DEBUG_PROCESS_DETACH_ON_EXIT`), and
+>   ends the program only when a `disconnect` asks for it.
+> - **Breakpoints in modules that aren't loaded yet** wait for the module (`sourceModules`: source folder = module
+>   name), then bind and say so with a `breakpoint` event. A line with no code moves to the next line that has some.
+> - **A sturdier event loop.** It survives a failed wait, a continue right after a step, and stray engine breaks.
+> - **Fast locals** (one read per level; lazy children), **hover** (locals and `this` members only, never a command),
+>   and **thread names** from Windows.
+> - **Unreal types read from memory** with the program's own PDB layouts: `FName`, `FString`, `TArray` items,
+>   `UObject*` / `TObjectPtr` as "Name (Class)", `FGuid`, soft object paths, gameplay tags, `TMap`/`TSet` counts and
+>   small number structs.
+>
+> Releases here hold `dap-dbgeng.exe` and `LICENSE` only. It needs Microsoft's `dbgeng.dll`, `dbgmodel.dll`,
+> `dbghelp.dll`, `dbgcore.dll` and `msdia140.dll` next to it, from the
+> [Microsoft.Debugging.Platform.DbgEng](https://www.nuget.org/packages/Microsoft.Debugging.Platform.DbgEng) package
+> (Amethyst downloads that package itself, after its licence is accepted).
+
+The original README follows.
 
 [![VS Marketplace](https://vsmarketplacebadges.dev/version/svnscha.vscode-dap-dbgeng.svg)](https://marketplace.visualstudio.com/items?itemName=svnscha.vscode-dap-dbgeng)
 [![CI](https://github.com/svnscha/dap-dbgeng/actions/workflows/ci.yml/badge.svg)](https://github.com/svnscha/dap-dbgeng/actions/workflows/ci.yml)

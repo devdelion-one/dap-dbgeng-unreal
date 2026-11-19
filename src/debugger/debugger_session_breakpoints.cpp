@@ -80,12 +80,25 @@ std::vector<source_breakpoint_result> debugger_session::set_source_breakpoints(
         }
     }
 
+    const std::string mapped_module = module_for_source(normalized_path);
+    const std::string mapped_file = normalized_path.substr(normalized_path.find_last_of("\\/") + 1);
     for (const auto &breakpoint : distinct)
     {
+        if (!mapped_module.empty())
+        {
+            configured_breakpoints[spec_key(breakpoint)] =
+                set_module_line_breakpoint(mapped_module, mapped_file, breakpoint.line, configured_breakpoint_ids);
+            continue;
+        }
         const std::vector<int> before_ids = get_configured_breakpoint_ids();
 
         // CreateSourceBreakpointCommand: bu `path:line` (+ /w "cond" if set).
-        const std::string source_location_token = fmt::format("`{}:{}`", normalized_path, breakpoint.line);
+        const std::string source_module = module_for_source(normalized_path);
+        const std::string source_location_token =
+            source_module.empty() ? fmt::format("`{}:{}`", normalized_path, breakpoint.line)
+                                  : fmt::format("`{}!{}:{}`", source_module,
+                                                normalized_path.substr(normalized_path.find_last_of("\\/") + 1),
+                                                breakpoint.line);
         std::string command;
         if (!breakpoint.condition || trim_both(*breakpoint.condition).empty())
         {
@@ -354,6 +367,144 @@ void debugger_session::clear_source_breakpoints(const std::string &normalized_pa
     for (int id : ids)
     {
         execute_command_with_output(fmt::format("bc {}", id), /*suppress_output_events=*/true);
+        std::erase_if(pending_line_breakpoints_, [id](const pending_line_breakpoint &p) { return p.id == id; });
+    }
+}
+
+namespace
+{
+// How many lines past the requested one a breakpoint may move to find code.
+constexpr int kLineSnapRange = 40;
+
+std::string lower_text(std::string text)
+{
+    for (char &ch : text)
+    {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    return text;
+}
+
+std::string no_code_message(int line)
+{
+    return fmt::format("No code on line {} or the {} lines after it.", line, kLineSnapRange - 1);
+}
+} // namespace
+
+bool debugger_session::is_module_loaded(const std::string &module)
+{
+    ULONG64 base = 0;
+    return SUCCEEDED(symbols_->GetModuleByModuleName(module.c_str(), 0, nullptr, &base)) && base != 0;
+}
+
+std::optional<std::pair<int, ULONG64>> debugger_session::resolve_source_line(const std::string &module,
+                                                                             const std::string &file_name, int line)
+{
+    for (int candidate = line; candidate < line + kLineSnapRange; ++candidate)
+    {
+        DEBUG_VALUE value{};
+        const std::string expression = fmt::format("`{}!{}:{}`", module, file_name, candidate);
+        if (FAILED(control_->Evaluate(expression.c_str(), DEBUG_VALUE_INT64, &value, nullptr)) || value.I64 == 0)
+        {
+            continue;
+        }
+        ULONG actual = static_cast<ULONG>(candidate);
+        ULONG64 displacement = 0;
+        if (FAILED(symbols_->GetLineByOffset(value.I64, &actual, nullptr, 0, nullptr, &displacement)))
+        {
+            actual = static_cast<ULONG>(candidate);
+        }
+        return std::make_pair(static_cast<int>(actual), static_cast<ULONG64>(value.I64));
+    }
+    return std::nullopt;
+}
+
+int debugger_session::add_code_breakpoint(std::optional<ULONG64> offset)
+{
+    IDebugBreakpoint2 *breakpoint = nullptr;
+    check_hr(control_->AddBreakpoint2(DEBUG_BREAKPOINT_CODE, DEBUG_ANY_ID, &breakpoint), "Could not add a breakpoint");
+    ULONG id = 0;
+    check_hr(breakpoint->GetId(&id), "Could not read a breakpoint id");
+    if (offset.has_value())
+    {
+        check_hr(breakpoint->SetOffset(*offset), "Could not place a breakpoint");
+        check_hr(breakpoint->AddFlags(DEBUG_BREAKPOINT_ENABLED), "Could not enable a breakpoint");
+    }
+    return static_cast<int>(id);
+}
+
+source_breakpoint_result debugger_session::set_module_line_breakpoint(const std::string &module,
+                                                                      const std::string &file_name, int line,
+                                                                      std::vector<int> &configured_ids)
+{
+    source_breakpoint_result result;
+    result.line = line;
+    if (is_module_loaded(module))
+    {
+        const auto resolved = resolve_source_line(module, file_name, line);
+        if (!resolved.has_value())
+        {
+            result.message = no_code_message(line);
+            return result;
+        }
+        const int id = add_code_breakpoint(resolved->second);
+        configured_ids.push_back(id);
+        result.id = id;
+        result.line = resolved->first;
+        result.verified = true;
+        return result;
+    }
+    const int id = add_code_breakpoint(std::nullopt);
+    configured_ids.push_back(id);
+    pending_line_breakpoints_.push_back(pending_line_breakpoint{id, module, file_name, line});
+    result.id = id;
+    result.pending = true;
+    result.message = fmt::format("Waits for {} to load.", module);
+    return result;
+}
+
+void debugger_session::bind_pending_breakpoints(const std::string &module_name, const std::string &image_name)
+{
+    if (pending_line_breakpoints_.empty())
+    {
+        return;
+    }
+    std::string from_image = image_name.substr(image_name.find_last_of("\\/") + 1);
+    from_image = from_image.substr(0, from_image.find_last_of('.'));
+    for (char &ch : from_image)
+    {
+        if (ch == '-')
+        {
+            ch = '_';
+        }
+    }
+    const std::string loaded_a = lower_text(module_name);
+    const std::string loaded_b = lower_text(from_image);
+
+    for (auto it = pending_line_breakpoints_.begin(); it != pending_line_breakpoints_.end();)
+    {
+        const std::string wanted = lower_text(it->module);
+        if (wanted != loaded_a && wanted != loaded_b)
+        {
+            ++it;
+            continue;
+        }
+        const auto resolved = resolve_source_line(it->module, it->file_name, it->line);
+        IDebugBreakpoint2 *breakpoint = nullptr;
+        if (resolved.has_value() && SUCCEEDED(control_->GetBreakpointById2(static_cast<ULONG>(it->id), &breakpoint)) &&
+            breakpoint != nullptr && SUCCEEDED(breakpoint->SetOffset(resolved->second)) &&
+            SUCCEEDED(breakpoint->AddFlags(DEBUG_BREAKPOINT_ENABLED)))
+        {
+            if (on_breakpoint_bound)
+            {
+                on_breakpoint_bound(it->id, true, resolved->first, std::string());
+            }
+        }
+        else if (on_breakpoint_bound)
+        {
+            on_breakpoint_bound(it->id, false, it->line, no_code_message(it->line));
+        }
+        it = pending_line_breakpoints_.erase(it);
     }
 }
 

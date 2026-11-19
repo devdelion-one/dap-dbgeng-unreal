@@ -37,6 +37,19 @@ struct named_value_info
 // during enumeration; `is_expandable` is set when the engine reports children we
 // did not inline (depth/budget cap reached), so a client can still show the
 // expand affordance. Leaf scalars have no children and is_expandable == false.
+// One child the Unreal reader wants shown under a value (an array's item):
+// where it lives and what type it is, so it can be read from memory directly,
+// and a typed expression that expands it later.
+struct unreal_child
+{
+    std::string name;
+    std::string expression;
+    std::string type;
+    std::uint64_t module_base = 0;
+    unsigned long type_id = 0;
+    std::uint64_t address = 0;
+};
+
 struct variable_node
 {
     std::string name;
@@ -48,6 +61,13 @@ struct variable_node
     std::uint64_t address = 0;
     std::uint32_t size = 0;
     std::vector<variable_node> children;
+    // Children the Unreal reader wants shown instead of the raw members; built
+    // after the tree is linked.
+    std::vector<unreal_child> reader_children;
+    bool reader_replaces = false;
+    // A typed expression whose children are built only when someone opens the
+    // node ("raw:" in front: its members without the Unreal reader).
+    std::string lazy_expression;
 };
 
 // A loaded module as reported by the engine.
@@ -107,6 +127,9 @@ struct source_breakpoint_result
     std::optional<int> id;
     int line = 0;
     bool verified = false;
+    // Set when the breakpoint waits for its module to load; it is bound (or
+    // reported as failing) by a later breakpoint event.
+    bool pending = false;
     std::optional<std::string> message;
 };
 

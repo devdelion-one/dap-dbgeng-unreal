@@ -354,6 +354,10 @@ void dap_server::disconnect_debugger_session(const disconnect_request_options &o
     }
 
     const bool should_terminate_debuggee = options.terminate_debuggee.value_or(terminate_debuggee_on_disconnect_);
+    if (should_terminate_debuggee)
+    {
+        session.request_terminate_on_dispose();
+    }
     const bool should_detach_debuggee =
         !should_terminate_debuggee && (detach_on_disconnect_ || terminate_debuggee_on_disconnect_);
     if (should_detach_debuggee)
@@ -437,6 +441,13 @@ void dap_server::apply_session_configuration(debugger::debugger_session &session
         session.enable_source_line_support();
         return 0;
     });
+    if (configuration.source_modules.has_value())
+    {
+        dispatcher_.invoke([&]() {
+            session.set_source_modules(*configuration.source_modules);
+            return 0;
+        });
+    }
     if (configuration.symbol_path.has_value())
     {
         dispatcher_.invoke([&]() {
@@ -456,6 +467,23 @@ void dap_server::apply_session_configuration(debugger::debugger_session &session
 void dap_server::wire_debugger_session(debugger::debugger_session &session)
 {
     debugger::debugger_session *self = &session;
+
+    session.on_breakpoint_bound = [this](int id, bool verified, int line, const std::string &message) {
+        protocol::BreakpointEvent event;
+        event.body.reason = protocol::BreakpointEventBodyReason::Changed;
+        event.body.breakpoint.id = id;
+        event.body.breakpoint.verified = verified;
+        event.body.breakpoint.line = line;
+        if (!message.empty())
+        {
+            event.body.breakpoint.message = message;
+        }
+        if (!verified)
+        {
+            event.body.breakpoint.reason = protocol::BreakpointReason::Failed;
+        }
+        send(nlohmann::json(event));
+    };
 
     session.on_breakpoint_hit = [this, self](std::uint32_t breakpoint_id) {
         if (try_auto_continue_conditional_breakpoint_hit(*self, breakpoint_id))
@@ -508,6 +536,15 @@ void dap_server::wire_debugger_session(debugger::debugger_session &session)
         if (skip_next_break_hit_event_.load())
         {
             skip_next_break_hit_event_.store(false);
+            return;
+        }
+        // The engine reports "break" while it works through events it then lets
+        // run on (module loads after an attach, a swallowed break-in). With no
+        // stop to report and no quiet break-in of our own under way, that is not
+        // a stop; marking it one leaves the session believing the target halted.
+        if (!suppress_session_events_.load() && !has_pending_stopped_event())
+        {
+            spdlog::debug("Ignoring an engine break with no stop to report.");
             return;
         }
         is_execution_running_.store(false);
@@ -734,6 +771,21 @@ int dap_server::create_variables_reference(const frame_context &context, variabl
     return reference;
 }
 
+int dap_server::create_lazy_variables_reference(const frame_context &context, const std::string &expression,
+                                                const std::string &evaluate_name)
+{
+    const int reference = next_variables_reference_++;
+    variable_container_context container;
+    container.thread_id = context.thread_id;
+    container.frame_number = context.frame_number;
+    container.kind = variable_container_kind::structure;
+    container.lazy_expression = expression;
+    container.lazy_evaluate_name = evaluate_name;
+    container.resolved = false;
+    variables_by_reference_[reference] = std::move(container);
+    return reference;
+}
+
 protocol::Variable dap_server::create_variable(const debugger::named_value_info &value)
 {
     protocol::Variable variable;
@@ -789,6 +841,10 @@ protocol::Variable dap_server::build_variable_tree(const debugger::variable_node
         variable.variables_reference =
             create_variables_reference(context, variable_container_kind::structure, children);
     }
+    else if (!node.lazy_expression.empty())
+    {
+        variable.variables_reference = create_lazy_variables_reference(context, node.lazy_expression, evaluate_name);
+    }
     else
     {
         variable.variables_reference = 0;
@@ -838,8 +894,8 @@ void dap_server::update_conditional_breakpoint_state(const std::string &source_p
     {
         const protocol::SourceBreakpoint &request = requested[index];
         const debugger::source_breakpoint_result &result = configured[index];
-        if (!request.condition.has_value() || util::is_blank(*request.condition) || !result.verified ||
-            !result.id.has_value())
+        if (!request.condition.has_value() || util::is_blank(*request.condition) ||
+            !(result.verified || result.pending) || !result.id.has_value())
         {
             continue;
         }

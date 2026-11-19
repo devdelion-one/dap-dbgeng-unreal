@@ -66,7 +66,7 @@ class debugger_session_dispatcher
     {
       public:
         explicit dispatcher_failure(std::string inner_message)
-            : std::runtime_error("A debugger session operation failed on the dispatcher thread."),
+            : std::runtime_error("A debugger session operation failed on the dispatcher thread: " + inner_message),
               inner_message_(std::move(inner_message))
         {
         }

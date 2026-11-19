@@ -43,6 +43,73 @@ std::string read_symbol_type(IDebugSymbolGroup2 *group, ULONG index)
     return {};
 }
 
+bool is_plain_number_type(const std::string &type)
+{
+    static const std::set<std::string> plain{"float", "double", "int", "unsigned int", "short", "unsigned short",
+                                             "char", "unsigned char", "signed char", "__int64", "unsigned __int64",
+                                             "long", "unsigned long", "bool", "int64", "uint64", "int32", "uint32",
+                                             "int16", "uint16", "int8", "uint8"};
+    return plain.count(type) != 0;
+}
+
+std::string compact_number(const std::string &type, const std::string &value)
+{
+    if (type != "float" && type != "double")
+    {
+        return value;
+    }
+    char *end = nullptr;
+    const double number = std::strtod(value.c_str(), &end);
+    if (end == value.c_str())
+    {
+        return value;
+    }
+    return fmt::format("{:.6g}", number);
+}
+
+// Static data members come back with no value ("<Value unavailable error>");
+// Visual Studio hides them, and so do we. A small struct of plain numbers
+// (FLinearColor, FVector2D, FIntPoint...) reads as "(R=0.2, G=0.8, ...)"
+// instead of its type name.
+void tidy_tree(std::vector<variable_node> &nodes)
+{
+    nodes.erase(std::remove_if(nodes.begin(), nodes.end(),
+                               [](const variable_node &n) { return n.type == "<Value unavailable error>"; }),
+                nodes.end());
+    for (auto &node : nodes)
+    {
+        tidy_tree(node.children);
+        const bool aggregate_text = node.value.rfind("struct ", 0) == 0 || node.value.rfind("class ", 0) == 0;
+        if (!aggregate_text || node.children.empty())
+        {
+            continue;
+        }
+        std::vector<std::string> parts;
+        bool plain = true;
+        for (const auto &child : node.children)
+        {
+            if (is_plain_number_type(child.type) && child.children.empty())
+            {
+                parts.push_back(child.name + "=" + compact_number(child.type, child.value));
+            }
+            else if (!(child.type.size() > 0 && child.type.back() == ']'))
+            {
+                plain = false;
+                break;
+            }
+        }
+        if (plain && !parts.empty() && parts.size() <= 6)
+        {
+            std::string summary = "(";
+            for (std::size_t i = 0; i < parts.size(); ++i)
+            {
+                summary += (i == 0 ? "" : ", ") + parts[i];
+            }
+            node.value = summary + ")";
+        }
+    }
+}
+
 // A pointer type (trailing '*') is expandable but we do not auto-follow it: that
 // risks cycles (linked lists) and unbounded depth. Such nodes stay leaves.
 bool type_is_pointer(const std::string &type)
@@ -198,6 +265,7 @@ std::vector<named_value_info> debugger_session::get_locals(std::uint32_t frame_n
 std::vector<variable_node> debugger_session::get_locals_tree(std::uint32_t frame_number)
 {
     throw_if_disposed();
+    const auto t_frame_start = std::chrono::steady_clock::now();
 
     // Same scope symbol group get_locals reads, but here we expand aggregate
     // members in place so structs/classes become a tree. The group is only live
@@ -227,7 +295,12 @@ std::vector<variable_node> debugger_session::get_locals_tree(std::uint32_t frame
     // on one symbol per scan. The EXPANDED flag stops us re-expanding a node;
     // pointers are skipped (no auto-follow). The loop terminates because each
     // successful expansion sets a flag, shrinking the eligible set.
-    for (;;)
+    // One depth level per pass: read the parameters once, then expand that
+    // level's aggregates from the last index to the first. Expanding a symbol
+    // only shifts the indices after it, so the indices still to visit stay
+    // valid. Re-reading everything after each single expansion made a large
+    // frame (UEditorEngine::Tick) take over 20 s.
+    for (int level = 0; level < kMaxExpansionDepth; ++level)
     {
         ULONG count = 0;
         if (FAILED(group->GetNumberSymbols(&count)) || count == 0 || count >= kMaxExpandedNodes)
@@ -240,30 +313,32 @@ std::vector<variable_node> debugger_session::get_locals_tree(std::uint32_t frame
             break;
         }
 
-        bool expanded_one = false;
-        for (ULONG i = 0; i < count; ++i)
+        bool expanded_any = false;
+        ULONG budget_left = static_cast<ULONG>(kMaxExpandedNodes) - count;
+        for (ULONG i = count; i-- > 0;)
         {
             const DEBUG_SYMBOL_PARAMETERS &p = params[i];
-            if ((p.Flags & kDebugSymbolExpanded) != 0 || p.SubElements == 0)
+            if ((p.Flags & kDebugSymbolExpanded) != 0 || p.SubElements == 0 || symbol_depth(params, i) != level)
             {
                 continue;
             }
-            if (symbol_depth(params, i) >= kMaxExpansionDepth || type_is_pointer(read_symbol_type(group, i)))
+            if (p.SubElements > budget_left || type_is_pointer(read_symbol_type(group, i)))
             {
                 continue;
             }
             if (SUCCEEDED(group->ExpandSymbol(i, TRUE)))
             {
-                expanded_one = true;
-                break;
+                expanded_any = true;
+                budget_left -= p.SubElements;
             }
         }
-        if (!expanded_one)
-        {
-            break;
-        }
+        (void)expanded_any;
     }
 
+    const auto t_phase2 = std::chrono::steady_clock::now();
+    long long t_reader_us = 0;
+    long long t_read_us = 0;
+    std::size_t node_count = 0;
     // Phase 2: read the now-stable flat list and rebuild the tree via ParentSymbol.
     std::vector<variable_node> roots;
     ULONG count = 0;
@@ -275,9 +350,31 @@ std::vector<variable_node> debugger_session::get_locals_tree(std::uint32_t frame
             std::vector<variable_node> nodes(count);
             for (ULONG i = 0; i < count; ++i)
             {
+                const auto t0 = std::chrono::steady_clock::now();
                 nodes[i].name = read_symbol_name(group, i);
                 nodes[i].value = normalize_value_text(read_symbol_value(group, i));
                 nodes[i].type = read_symbol_type(group, i);
+                const auto t1 = std::chrono::steady_clock::now();
+                // The fields inside a value already shown as an object pointer
+                // (DebugPtr, Handle...) are dropped; don't read them.
+                const ULONG parent = params[i].ParentSymbol;
+                const bool inside_object_pointer =
+                    parent != kDebugAnyId && parent < i && !nodes[parent].lazy_expression.empty() &&
+                    !nodes[parent].reader_replaces;
+                if (!inside_object_pointer)
+                {
+                    apply_unreal_view(group, i, nodes[i], /*summarize=*/false);
+                }
+                const auto t2 = std::chrono::steady_clock::now();
+                if (std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() > 20)
+                {
+                    spdlog::debug("slow reader node {} ms: {} [{}]",
+                                  std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count(), nodes[i].name,
+                                  nodes[i].type);
+                }
+                t_read_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+                t_reader_us += std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+                ++node_count;
                 // Expandable but not inlined (depth/budget cap or pointer): leave
                 // children empty so the caller can still flag it if it wants.
                 nodes[i].is_expandable = params[i].SubElements != 0 && (params[i].Flags & kDebugSymbolExpanded) == 0;
@@ -317,7 +414,342 @@ std::vector<variable_node> debugger_session::get_locals_tree(std::uint32_t frame
     }
 
     group->Release();
+    const auto t_expand = std::chrono::steady_clock::now();
+    for (auto &root : roots)
+    {
+        expand_reader_children(root);
+    }
+    tidy_tree(roots);
+    const auto t_done = std::chrono::steady_clock::now();
+    spdlog::debug("locals tree: expand {} ms, {} nodes, engine read {} ms, reader {} ms, children+tidy {} ms",
+                  std::chrono::duration_cast<std::chrono::milliseconds>(t_phase2 - t_frame_start).count(), node_count,
+                  t_read_us / 1000, t_reader_us / 1000,
+                  std::chrono::duration_cast<std::chrono::milliseconds>(t_done - t_expand).count());
     return roots;
+}
+
+void debugger_session::apply_unreal_view(IDebugSymbolGroup2 *group, ULONG index, variable_node &node, bool summarize)
+{
+    if (unreal_reader_ == nullptr)
+    {
+        return;
+    }
+    DEBUG_SYMBOL_ENTRY entry{};
+    if (FAILED(group->GetSymbolEntryInformation(index, &entry)))
+    {
+        return;
+    }
+    ULONG64 address = 0;
+    if (FAILED(group->GetSymbolOffset(index, &address)))
+    {
+        address = 0;
+    }
+    const auto view = unreal_reader_->view(node.type, entry.ModuleBase, entry.TypeId, address, node.value);
+    if (!view.has_value())
+    {
+        const bool aggregate_text = node.value.rfind("struct ", 0) == 0 || node.value.rfind("class ", 0) == 0;
+        if (summarize && aggregate_text && address != 0)
+        {
+            if (const auto summary = unreal_reader_->summary(entry.ModuleBase, entry.TypeId, address))
+            {
+                node.value = *summary;
+            }
+        }
+        return;
+    }
+    node.value = view->display;
+    if (!view->expand_expression.empty())
+    {
+        node.lazy_expression = view->expand_expression;
+    }
+    if (view->replaces_children)
+    {
+        node.reader_replaces = true;
+        node.reader_children = view->children;
+        if (address != 0)
+        {
+            node.lazy_expression = unreal_reader_->typed_expression(entry.ModuleBase, node.type, address);
+        }
+    }
+}
+
+variable_node debugger_session::node_from_reader_child(const unreal_child &child)
+{
+    variable_node node;
+    node.name = child.name;
+    node.type = child.type;
+    node.address = child.address;
+    if (const auto plain = unreal_reader_->plain_value(child.type, child.address))
+    {
+        node.value = *plain;
+        return node;
+    }
+    const auto view = unreal_reader_->view(child.type, child.module_base, child.type_id, child.address, "");
+    if (view.has_value())
+    {
+        node.value = view->display;
+        if (!view->expand_expression.empty())
+        {
+            node.lazy_expression = view->expand_expression;
+        }
+        else if (view->replaces_children)
+        {
+            node.lazy_expression = child.expression;
+        }
+    }
+    else
+    {
+        node.value = unreal_reader_->summary(child.module_base, child.type_id, child.address).value_or("{...}");
+        if (child.type.empty() || child.type.back() != '*')
+        {
+            node.lazy_expression = child.expression;
+        }
+    }
+    node.is_expandable = !node.lazy_expression.empty();
+    return node;
+}
+
+void debugger_session::expand_reader_children(variable_node &node)
+{
+    if (node.reader_replaces)
+    {
+        std::vector<variable_node> raw = std::move(node.children);
+        node.children.clear();
+        for (const auto &child : node.reader_children)
+        {
+            node.children.push_back(node_from_reader_child(child));
+        }
+        node.reader_children.clear();
+        node.reader_replaces = false;
+        node.lazy_expression.clear();
+        if (!raw.empty())
+        {
+            variable_node raw_view;
+            raw_view.name = "[Raw View]";
+            raw_view.type = node.type;
+            raw_view.children = std::move(raw);
+            node.children.push_back(std::move(raw_view));
+        }
+        return;
+    }
+    if (!node.lazy_expression.empty())
+    {
+        // An object pointer opens onto the object; its raw handle fields go.
+        node.children.clear();
+        node.is_expandable = true;
+        return;
+    }
+    for (auto &child : node.children)
+    {
+        expand_reader_children(child);
+    }
+}
+
+std::vector<variable_node> debugger_session::expand_expression(std::uint32_t frame_number,
+                                                               const std::string &expression_text)
+{
+    throw_if_disposed();
+    const bool raw = expression_text.rfind("raw:", 0) == 0;
+    const std::string expression = raw ? expression_text.substr(4) : expression_text;
+
+    // `*(Module!Type *)0x...` needs no frame: an empty group is far cheaper than
+    // the frame's whole scope group.
+    const bool absolute = expression.rfind("*(", 0) == 0 && expression.find(")0x") != std::string::npos;
+    ULONG index = DEBUG_ANY_ID;
+    IDebugSymbolGroup2 *group = nullptr;
+    const auto t_start = std::chrono::steady_clock::now();
+    const auto ms_since = [&]() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_start).count();
+    };
+    struct timing_log
+    {
+        std::function<long long()> f;
+        std::string e;
+        ~timing_log()
+        {
+            spdlog::debug("expand_expression {} ms: {}", f(), e);
+        }
+    } timing{ms_since, expression};
+    if (absolute)
+    {
+        if (FAILED(symbols_->CreateSymbolGroup2(&group)) || group == nullptr)
+        {
+            throw std::runtime_error("Could not create a symbol group.");
+        }
+        const HRESULT added = group->AddSymbol(expression.c_str(), &index);
+        spdlog::debug("expand_expression AddSymbol {} ms", ms_since());
+        if (FAILED(added) || index == DEBUG_ANY_ID)
+        {
+            group->Release();
+            throw std::runtime_error(fmt::format("Could not resolve '{}'.", expression));
+        }
+    }
+    else
+    {
+        group = open_scope_symbol_group(frame_number, expression, index);
+    }
+    struct group_releaser
+    {
+        IDebugSymbolGroup2 *g;
+        ~group_releaser()
+        {
+            g->Release();
+        }
+    } releaser{group};
+
+    std::vector<variable_node> out;
+    if (!raw && unreal_reader_ != nullptr)
+    {
+        variable_node self;
+        self.value = normalize_value_text(read_symbol_value(group, index));
+        self.type = read_symbol_type(group, index);
+        DEBUG_SYMBOL_ENTRY entry{};
+        ULONG64 address = 0;
+        group->GetSymbolOffset(index, &address);
+        if (SUCCEEDED(group->GetSymbolEntryInformation(index, &entry)))
+        {
+            const auto view = unreal_reader_->view(self.type, entry.ModuleBase, entry.TypeId, address, self.value);
+            if (view.has_value() && view->replaces_children)
+            {
+                for (const auto &child : view->children)
+                {
+                    out.push_back(node_from_reader_child(child));
+                }
+                variable_node raw_view;
+                raw_view.name = "[Raw View]";
+                raw_view.type = self.type;
+                raw_view.lazy_expression = "raw:" + expression;
+                raw_view.is_expandable = true;
+                out.push_back(std::move(raw_view));
+                return out;
+            }
+            if (view.has_value() && !view->expand_expression.empty() && view->expand_expression != expression)
+            {
+                return expand_expression(frame_number, view->expand_expression);
+            }
+        }
+    }
+
+    DEBUG_SYMBOL_PARAMETERS params{};
+    if (FAILED(group->GetSymbolParameters(index, 1, &params)) || params.SubElements == 0 ||
+        FAILED(group->ExpandSymbol(index, TRUE)))
+    {
+        return out;
+    }
+    ULONG count = 0;
+    if (FAILED(group->GetNumberSymbols(&count)) || count <= index + 1)
+    {
+        return out;
+    }
+    std::vector<DEBUG_SYMBOL_PARAMETERS> children(count);
+    if (FAILED(group->GetSymbolParameters(0, count, children.data())))
+    {
+        return out;
+    }
+    for (ULONG i = index + 1; i < count; ++i)
+    {
+        if (children[i].ParentSymbol != index)
+        {
+            continue;
+        }
+        variable_node child;
+        child.name = read_symbol_name(group, i);
+        child.type = read_symbol_type(group, i);
+        if (child.type == "<Value unavailable error>")
+        {
+            continue; // a static member
+        }
+        child.value = normalize_value_text(read_symbol_value(group, i));
+        ULONG64 child_address = 0;
+        if (SUCCEEDED(group->GetSymbolOffset(i, &child_address)))
+        {
+            child.address = child_address;
+        }
+        apply_unreal_view(group, i, child);
+        child.reader_children.clear();
+        child.reader_replaces = false;
+        if (child.lazy_expression.empty() && children[i].SubElements != 0 && child_address != 0 &&
+            !type_is_pointer(child.type) && unreal_reader_ != nullptr)
+        {
+            DEBUG_SYMBOL_ENTRY entry{};
+            if (SUCCEEDED(group->GetSymbolEntryInformation(i, &entry)))
+            {
+                child.lazy_expression = unreal_reader_->typed_expression(entry.ModuleBase, child.type, child_address);
+            }
+        }
+        child.is_expandable = !child.lazy_expression.empty();
+        out.push_back(std::move(child));
+    }
+    return out;
+}
+
+std::optional<std::string> debugger_session::hover_expression(std::uint32_t frame_number,
+                                                              const std::string &expression)
+{
+    throw_if_disposed();
+    // The first name in "A", "A.B" or "A->B".
+    std::size_t end = 0;
+    while (end < expression.size() &&
+           (std::isalnum(static_cast<unsigned char>(expression[end])) != 0 || expression[end] == '_'))
+    {
+        ++end;
+    }
+    if (end == 0 || std::isdigit(static_cast<unsigned char>(expression[0])) != 0)
+    {
+        return std::nullopt;
+    }
+    const std::string first = expression.substr(0, end);
+    const std::string rest = expression.substr(end);
+    if (!rest.empty() && rest.rfind(".", 0) != 0 && rest.rfind("->", 0) != 0 && rest.rfind("[", 0) != 0)
+    {
+        return std::nullopt;
+    }
+
+    execute_command_with_output(fmt::format(".frame {}", frame_number), /*suppress_output_events=*/true);
+    PDEBUG_SYMBOL_GROUP base_group = nullptr;
+    if (FAILED(symbols_->GetScopeSymbolGroup(kDebugScopeGroupAll, nullptr, &base_group)) || base_group == nullptr)
+    {
+        return std::nullopt;
+    }
+    IDebugSymbolGroup2 *group = nullptr;
+    const HRESULT qi = base_group->QueryInterface(__uuidof(IDebugSymbolGroup2), reinterpret_cast<PVOID *>(&group));
+    base_group->Release();
+    if (FAILED(qi) || group == nullptr)
+    {
+        return std::nullopt;
+    }
+    bool is_local = false;
+    bool has_this = false;
+    ULONG count = 0;
+    if (SUCCEEDED(group->GetNumberSymbols(&count)) && count != 0)
+    {
+        // The frame's scope group is shared and may still be expanded from the
+        // locals tree: only its top-level symbols are locals.
+        std::vector<DEBUG_SYMBOL_PARAMETERS> params(count);
+        if (SUCCEEDED(group->GetSymbolParameters(0, count, params.data())))
+        {
+            for (ULONG i = 0; i < count; ++i)
+            {
+                if (params[i].ParentSymbol != kDebugAnyId)
+                {
+                    continue;
+                }
+                const std::string name = read_symbol_name(group, i);
+                is_local = is_local || name == first;
+                has_this = has_this || name == "this";
+            }
+        }
+    }
+    group->Release();
+    if (is_local)
+    {
+        return expression;
+    }
+    if (has_this)
+    {
+        return "this->" + expression;
+    }
+    return std::nullopt;
 }
 
 IDebugSymbolGroup2 *debugger_session::open_scope_symbol_group(std::uint32_t frame_number, const std::string &expression,
@@ -415,6 +847,17 @@ variable_node debugger_session::get_local_value(std::uint32_t frame_number, cons
     if (node.type.empty())
     {
         throw std::runtime_error(fmt::format("Could not resolve '{}' in the current frame.", expression));
+    }
+    apply_unreal_view(group, index, node);
+    node.reader_children.clear();
+    node.reader_replaces = false;
+    if (node.lazy_expression.empty())
+    {
+        DEBUG_SYMBOL_PARAMETERS params{};
+        if (SUCCEEDED(group->GetSymbolParameters(index, 1, &params)) && params.SubElements != 0)
+        {
+            node.lazy_expression = expression;
+        }
     }
     return node;
 }
