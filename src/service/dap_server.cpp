@@ -708,6 +708,7 @@ void dap_server::reset_launch_configuration_state()
 void dap_server::reset_suspended_state()
 {
     frame_contexts_.clear();
+    goto_targets_.clear();
     variables_by_reference_.clear();
     next_variables_reference_ = 1;
     {
@@ -757,7 +758,9 @@ void dap_server::register_frames(int thread_id, const std::vector<debugger::stac
     for (const auto &frame : frames)
     {
         const int frame_id = factory::create_frame_id(thread_id, frame.frame_number);
-        frame_contexts_[frame_id] = frame_context{thread_id, frame.frame_number, frame.source};
+        frame_contexts_[frame_id] = frame.script_frame != 0
+                                        ? frame_context{thread_id, frame.native_frame, std::nullopt, frame.script_frame}
+                                        : frame_context{thread_id, frame.frame_number, frame.source};
     }
 }
 
@@ -771,6 +774,7 @@ int dap_server::create_variables_reference(const frame_context &context, variabl
     const int reference = next_variables_reference_++;
     variables_by_reference_[reference] =
         variable_container_context{context.thread_id, context.frame_number, kind, variables};
+    variables_by_reference_[reference].script = context.script_frame != 0;
     return reference;
 }
 
@@ -785,6 +789,7 @@ int dap_server::create_lazy_variables_reference(const frame_context &context, co
     container.lazy_expression = expression;
     container.lazy_evaluate_name = evaluate_name;
     container.resolved = false;
+    container.script = context.script_frame != 0;
     variables_by_reference_[reference] = std::move(container);
     return reference;
 }

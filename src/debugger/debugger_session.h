@@ -125,6 +125,18 @@ class debugger_session
     std::pair<std::uint64_t, std::uint32_t> get_symbol_address(std::uint32_t frame_number,
                                                                const std::string &expression);
     std::vector<named_value_info> get_registers(std::uint32_t frame_number);
+    // A Blueprint frame's parameters and locals (and `self`), from its FFrame.
+    std::vector<variable_node> get_script_locals(std::uint64_t script_frame);
+
+    // Set next statement ----------------------------------------------------
+    // Where `line` of `file_path` runs in the current thread's top function,
+    // snapping forward to the next line with code as line breakpoints do.
+    // Throws with the reason when the line is outside that function, has no
+    // code, or is the function's entry.
+    goto_target resolve_goto_target(const std::string &file_path, int line);
+    // Moves the current thread's instruction pointer to `address`, which must
+    // be in the same function as the thread's current one.
+    void set_instruction_pointer(std::uint64_t address);
     std::optional<source_location> try_get_frame_source(std::uint64_t instruction_offset);
 
     // Threads -----------------------------------------------------------------
@@ -218,6 +230,14 @@ class debugger_session
     std::optional<disassembled_instruction_info> disassemble_one(std::uint64_t address, bool resolve_symbols,
                                                                  std::uint64_t &end_offset);
     std::optional<std::string> try_get_frame_name(std::uint64_t instruction_offset);
+    // The function an address is in: its name and first instruction.
+    std::optional<std::pair<std::string, std::uint64_t>> function_at(std::uint64_t address);
+    std::uint64_t current_instruction_offset();
+    // Puts the thread's Blueprint frames among its native ones: each goes just
+    // above the engine frame whose stack holds its FFrame (ProcessEvent or
+    // ProcessScriptFunction, which run it).
+    void add_script_frames(const std::vector<DEBUG_STACK_FRAME_EX> &native, std::vector<stack_frame_info> &frames,
+                           int &total_frames);
     bool try_get_symbol_start(std::uint64_t instruction_offset, std::uint64_t &symbol_start);
 
     std::uint32_t get_last_breakpoint_id();

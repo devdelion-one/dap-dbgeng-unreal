@@ -127,6 +127,21 @@ protocol::StackFrame create_stack_frame(int thread_id, const debugger::stack_fra
     stack_frame.line = frame.source.has_value() ? frame.source->line : 0;
     stack_frame.column = frame.source.has_value() ? 1 : 0;
     stack_frame.instruction_pointer_reference = format_address(frame.instruction_offset);
+    if (frame.script_frame != 0)
+    {
+        // A Blueprint function: no file, marked by its module and its source's
+        // origin; the source names the object it runs on.
+        stack_frame.name = name;
+        protocol::Source source;
+        source.name = frame.script_object;
+        source.origin = "Blueprint";
+        stack_frame.source = source;
+        stack_frame.line = 0;
+        stack_frame.column = 0;
+        stack_frame.instruction_pointer_reference.reset();
+        stack_frame.module_id = "Blueprint";
+        stack_frame.presentation_hint = protocol::StackFramePresentationHint::Normal;
+    }
     return stack_frame;
 }
 

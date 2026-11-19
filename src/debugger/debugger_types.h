@@ -107,6 +107,12 @@ struct stack_frame_info
     std::uint64_t instruction_offset = 0;
     std::optional<std::string> name;
     std::optional<source_location> source;
+    // A Blueprint function the engine's script interpreter runs (no source):
+    // its FFrame, the object it runs on, and the engine frame that runs it
+    // (scopes and evaluate use that frame's context).
+    std::uint64_t script_frame = 0;
+    std::string script_object;
+    std::uint32_t native_frame = 0;
 };
 
 // A stack trace plus the total frame count for paging.
@@ -114,6 +120,14 @@ struct stack_trace_details
 {
     std::vector<stack_frame_info> frames;
     int total_frames = 0;
+};
+
+// Where set next statement puts the instruction pointer: the line's first
+// instruction in the current function, and the line it really is.
+struct goto_target
+{
+    std::uint64_t address = 0;
+    int line = 0;
 };
 
 // A requested source breakpoint (line + optional condition).

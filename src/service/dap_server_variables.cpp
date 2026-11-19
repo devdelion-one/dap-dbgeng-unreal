@@ -36,6 +36,7 @@ void dap_server::handle_variables_request(const protocol::VariablesRequest &requ
         frame_context context;
         context.thread_id = container.thread_id;
         context.frame_number = container.frame_number;
+        context.script_frame = container.script ? 1 : 0;
         std::vector<debugger::variable_node> nodes;
         try
         {

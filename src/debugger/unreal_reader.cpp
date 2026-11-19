@@ -324,6 +324,9 @@ void unreal_reader::forget_modules()
     text_histories_.clear();
     dynamic_types_.clear();
     layouts_.clear();
+    script_module_.reset();
+    top_frame_tls_.reset();
+    engine_types_.clear();
 }
 
 ULONG64 unreal_reader::module_with_type(ULONG64 module_base, const char *type, const char *probe_field)
@@ -477,17 +480,6 @@ std::string unreal_reader::module_name(ULONG64 module_base)
     }
     module_names_[module_base] = name;
     return name;
-}
-
-template <class T> std::optional<T> unreal_reader::read(ULONG64 address)
-{
-    T value{};
-    ULONG done = 0;
-    if (address == 0 || FAILED(data_->ReadVirtual(address, &value, sizeof(T), &done)) || done != sizeof(T))
-    {
-        return std::nullopt;
-    }
-    return value;
 }
 
 std::optional<std::string> unreal_reader::read_text(ULONG64 address, std::size_t count, bool wide)
@@ -798,6 +790,60 @@ std::optional<ULONG64> unreal_reader::object_pointer(ULONG64 module_base, ULONG 
         }
     }
     return std::nullopt;
+}
+
+std::optional<std::string> unreal_reader::object_name(ULONG64 module_base, ULONG64 object)
+{
+    if (object == 0)
+    {
+        return std::nullopt;
+    }
+    module_base = module_with_type(module_base, "UObjectBase", "NamePrivate");
+    const auto base = type_id(module_base, "UObjectBase");
+    if (!base)
+    {
+        return std::nullopt;
+    }
+    const auto name_field = field(module_base, *base, "NamePrivate");
+    if (!name_field)
+    {
+        return std::nullopt;
+    }
+    ULONG name_type = name_field->type_id;
+    ULONG name_offset = name_field->offset;
+    if (type_name(module_base, name_type) != "FName")
+    {
+        if (const auto inner = field(module_base, name_type, "Name"))
+        {
+            name_type = inner->type_id;
+            name_offset += inner->offset;
+        }
+    }
+    return read_name(module_base, name_type, object + name_offset);
+}
+
+std::optional<ULONG64> unreal_reader::object_field(ULONG64 module_base, ULONG64 object, const char *type,
+                                                   const char *name)
+{
+    if (object == 0)
+    {
+        return std::nullopt;
+    }
+    const auto id = type_id(module_base, type);
+    if (!id)
+    {
+        return std::nullopt;
+    }
+    const auto found = field(module_base, *id, name);
+    if (!found)
+    {
+        return std::nullopt;
+    }
+    if (const auto pointer = object_pointer(module_base, found->type_id, object + found->offset))
+    {
+        return pointer;
+    }
+    return read<ULONG64>(object + found->offset);
 }
 
 std::optional<std::string> unreal_reader::object_label(ULONG64 module_base, ULONG64 object)

@@ -21,6 +21,29 @@ void dap_server::handle_scopes_request(const protocol::ScopesRequest &request)
     }
     const frame_context context = context_it->second;
 
+    if (context.script_frame != 0)
+    {
+        // A Blueprint frame: its parameters and locals, read from its FFrame.
+        const std::vector<debugger::variable_node> nodes = read_session_data_or_default<>(
+            [this, &context](debugger::debugger_session &session) {
+                return dispatcher_.invoke([&]() { return session.get_script_locals(context.script_frame); });
+            },
+            std::vector<debugger::variable_node>{});
+        std::vector<protocol::Variable> variables;
+        variables.reserve(nodes.size());
+        for (const auto &node : nodes)
+        {
+            variables.push_back(build_variable_tree(node, context, std::string{}));
+        }
+        protocol::ScopesResponse response;
+        response.body.scopes = {create_scope("Locals", protocol::ScopePresentationHint::Locals,
+                                             create_variables_reference(context, variable_container_kind::locals,
+                                                                        variables),
+                                             static_cast<int>(nodes.size()), std::nullopt)};
+        send_response(request.seq, request.command, std::move(response));
+        return;
+    }
+
     using named_values = std::vector<debugger::named_value_info>;
     using variable_tree = std::vector<debugger::variable_node>;
     std::pair<variable_tree, named_values> values = read_session_data_or_default<>(

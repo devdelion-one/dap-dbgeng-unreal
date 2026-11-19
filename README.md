@@ -21,6 +21,15 @@
 >   half a second per member query on a big template.
 > - **An "ensure() failures" exception filter** (on by default). Off, a `__debugbreak` in the program's own code
 >   (Unreal's `ensure()`) is passed over and the program runs on. On, the stop says which ensure failed.
+> - **Set next statement** (`gotoTargets` / `goto`). A line resolves as a line breakpoint does, in the current
+>   function only: a line outside it, or the function's own entry, is refused with the reason. `gotoTargets` takes
+>   a `threadId` (an extension); `goto` moves that thread's instruction pointer, then reports a `goto` stop.
+> - **Blueprint frames in the call stack.** Each function the engine's script interpreter runs (the thread's
+>   `GTopTrackingStackFrame` chain of `FFrame`s) sits above the engine frame that runs it, named
+>   "Blueprint · Function", with `moduleId: "Blueprint"` and a source that names the object (no file). Its scope
+>   holds the function's parameters and locals, read through its own `FProperty` list, and `self`.
+> - **Program output that isn't UTF-8** (a log line with an em dash, in the ANSI code page) is converted before it
+>   is sent. Before, it ended the adapter.
 >
 > Releases here hold `dap-dbgeng.exe` and `LICENSE` only. It needs Microsoft's `dbgeng.dll`, `dbgmodel.dll`,
 > `dbghelp.dll`, `dbgcore.dll` and `msdia140.dll` next to it, from the

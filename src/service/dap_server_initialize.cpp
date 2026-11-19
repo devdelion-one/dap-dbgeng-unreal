@@ -23,6 +23,7 @@ void dap_server::handle_initialize_request(const protocol::InitializeRequest &re
     capabilities.supports_evaluate_for_hovers = true;
     capabilities.supports_exception_info_request = true;
     capabilities.supports_function_breakpoints = true;
+    capabilities.supports_goto_targets_request = true;
     capabilities.supports_hit_conditional_breakpoints = false;
     capabilities.supports_instruction_breakpoints = true;
     capabilities.supports_log_points = false;

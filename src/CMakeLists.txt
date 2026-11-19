@@ -14,10 +14,12 @@ add_library(dap-dbgeng-objects OBJECT
   debugger/debugger_session_execution.cpp
   debugger/debugger_session_inspection.cpp
   debugger/debugger_session_memory.cpp
+  debugger/debugger_session_script.cpp
   debugger/debugger_session_symbols.cpp
   debugger/debugger_session_targets.cpp
   debugger/debugger_session_threads.cpp
   debugger/unreal_reader.cpp
+  debugger/unreal_script.cpp
   service/dap_server.cpp
   service/dap_server_session_events.cpp
   service/dap_server_attach.cpp
@@ -27,6 +29,7 @@ add_library(dap-dbgeng-objects OBJECT
   service/dap_server_disassemble.cpp
   service/dap_server_disconnect.cpp
   service/dap_server_evaluate.cpp
+  service/dap_server_goto.cpp
   service/dap_server_exception_info.cpp
   service/dap_server_initialize.cpp
   service/dap_server_launch.cpp

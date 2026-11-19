@@ -180,7 +180,7 @@ stack_trace_details debugger_session::get_stack_trace_details(int max_frames)
              "Could not enumerate stack trace");
     frames.resize(filled);
 
-    const int total_frames = static_cast<int>(filled);
+    int total_frames = static_cast<int>(filled);
     const int fetch_count = get_stack_trace_fetch_count(total_frames, max_frames);
 
     std::vector<stack_frame_info> result;
@@ -195,6 +195,7 @@ stack_trace_details debugger_session::get_stack_trace_details(int max_frames)
         info.source = try_get_frame_source(frame.InstructionOffset);
         result.push_back(std::move(info));
     }
+    add_script_frames(frames, result, total_frames);
 
     return stack_trace_details{std::move(result), total_frames};
 }

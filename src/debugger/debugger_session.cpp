@@ -316,6 +316,62 @@ class debugger_session::event_callbacks : public IDebugEventCallbacks
 // ---------------------------------------------------------------------------
 // COM output-callback sink.
 // ---------------------------------------------------------------------------
+namespace
+{
+bool is_valid_utf8(const std::string &text)
+{
+    std::size_t i = 0;
+    while (i < text.size())
+    {
+        const auto lead = static_cast<unsigned char>(text[i]);
+        const std::size_t length = lead < 0x80 ? 1 : (lead >> 5) == 0x6 ? 2 : (lead >> 4) == 0xE ? 3 : (lead >> 3) == 0x1E ? 4 : 0;
+        if (length == 0 || i + length > text.size())
+        {
+            return false;
+        }
+        for (std::size_t k = 1; k < length; ++k)
+        {
+            if ((static_cast<unsigned char>(text[i + k]) & 0xC0) != 0x80)
+            {
+                return false;
+            }
+        }
+        i += length;
+    }
+    return true;
+}
+
+// The engine hands over the program's debug output in the ANSI code page
+// (OutputDebugStringW is narrowed on the way): an em dash arrives as 0x97.
+// DAP is UTF-8, and text that isn't would end the adapter when it is sent.
+std::string to_utf8(const std::string &text)
+{
+    if (is_valid_utf8(text))
+    {
+        return text;
+    }
+    const int wide_length = MultiByteToWideChar(CP_ACP, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
+    if (wide_length <= 0)
+    {
+        std::string ascii = text;
+        for (char &ch : ascii)
+        {
+            if (static_cast<unsigned char>(ch) >= 0x80)
+            {
+                ch = '?';
+            }
+        }
+        return ascii;
+    }
+    std::wstring wide(static_cast<std::size_t>(wide_length), L' ');
+    MultiByteToWideChar(CP_ACP, 0, text.data(), static_cast<int>(text.size()), wide.data(), wide_length);
+    const int length = WideCharToMultiByte(CP_UTF8, 0, wide.data(), wide_length, nullptr, 0, nullptr, nullptr);
+    std::string out(static_cast<std::size_t>(std::max(length, 0)), ' ');
+    WideCharToMultiByte(CP_UTF8, 0, wide.data(), wide_length, out.data(), length, nullptr, nullptr);
+    return out;
+}
+} // namespace
+
 class debugger_session::output_callbacks : public IDebugOutputCallbacks
 {
   public:
@@ -357,7 +413,7 @@ class debugger_session::output_callbacks : public IDebugOutputCallbacks
         (void)mask;
         if (text != nullptr && text[0] != '\0')
         {
-            owner_->handle_output_received(text);
+            owner_->handle_output_received(to_utf8(text));
         }
         return S_OK;
     }

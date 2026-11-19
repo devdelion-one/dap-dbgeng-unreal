@@ -77,6 +77,28 @@ class unreal_reader
     // from the type's layout; nullopt when there is none.
     std::optional<std::vector<unreal_child>> members(ULONG64 module_base, ULONG type_id, ULONG64 address);
 
+    // One function the engine's script interpreter runs on a thread: its
+    // FFrame, the UFunction, the object it runs on and its locals' memory.
+    struct script_frame
+    {
+        ULONG64 frame = 0;
+        ULONG64 function = 0;
+        ULONG64 object = 0;
+        ULONG64 locals = 0;
+        std::string function_name;
+        std::string object_name;
+        // The class that defines the function, without a Blueprint's "_C".
+        std::string owner;
+        bool native = false;
+    };
+    // A thread's script frames, outermost first: CoreUObject's thread_local
+    // GTopTrackingStackFrame and the PreviousTrackingFrame chain behind it.
+    // Empty when the thread runs no script.
+    std::vector<script_frame> script_stack(ULONG64 teb);
+    // A script frame's parameters and locals, read with its UFunction's own
+    // property list (the FProperty chain), plus `self`, the object.
+    std::vector<variable_node> script_locals(ULONG64 frame);
+
     // Names are global and never change once made, so their cache lives for the
     // whole session; this only drops what depends on loaded modules.
     void forget_modules();
@@ -93,7 +115,16 @@ class unreal_reader
     std::string type_name(ULONG64 module_base, ULONG type_id);
     ULONG type_size(ULONG64 module_base, ULONG type_id);
 
-    template <class T> std::optional<T> read(ULONG64 address);
+    template <class T> std::optional<T> read(ULONG64 address)
+    {
+        T value{};
+        ULONG done = 0;
+        if (address == 0 || FAILED(data_->ReadVirtual(address, &value, sizeof(T), &done)) || done != sizeof(T))
+        {
+            return std::nullopt;
+        }
+        return value;
+    }
     std::optional<std::string> read_text(ULONG64 address, std::size_t count, bool wide);
 
     std::optional<std::string> read_name(ULONG64 module_base, ULONG type_id, ULONG64 address);
@@ -110,6 +141,23 @@ class unreal_reader
                                          const std::string &array_type_name);
     std::optional<ULONG64> object_pointer(ULONG64 module_base, ULONG type_id, ULONG64 address, int depth = 0);
     std::optional<std::string> object_label(ULONG64 module_base, ULONG64 object);
+    // An object's own name, and the objects its ClassPrivate / OuterPrivate /
+    // a pointer field names.
+    std::optional<std::string> object_name(ULONG64 module_base, ULONG64 object);
+    std::optional<ULONG64> object_field(ULONG64 module_base, ULONG64 object, const char *type, const char *name);
+
+    // The script stack's own plumbing (unreal_script.cpp).
+    std::optional<ULONG64> script_module();
+    // Where the thread whose TEB this is keeps GTopTrackingStackFrame.
+    std::optional<ULONG64> top_frame_address(ULONG64 module_base, ULONG64 teb);
+    std::optional<script_frame> read_script_frame(ULONG64 module_base, ULONG64 frame);
+    variable_node property_node(ULONG64 module_base, ULONG64 property, ULONG64 address, int depth);
+    std::string property_type(ULONG64 module_base, ULONG64 property, const std::string &property_class);
+    std::optional<std::pair<ULONG64, ULONG>> engine_type(const std::string &name);
+    std::optional<ULONG64> script_module_;
+    // CoreUObject's _tls_index and the variable's offset in its TLS block.
+    std::optional<std::optional<std::pair<std::uint32_t, ULONG64>>> top_frame_tls_;
+    std::map<std::string, std::optional<std::pair<ULONG64, ULONG>>> engine_types_;
     std::optional<std::string> soft_path(ULONG64 module_base, ULONG type_id, ULONG64 address, int depth = 0);
     // Where an allocator keeps its items: the heap pointer, or the inline
     // storage of an inline allocator that hasn't spilled.

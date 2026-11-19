@@ -45,6 +45,11 @@ void dap_server::handle_set_variable_request(const protocol::SetVariableRequest 
     }
 
     variable_container_context container = container_it->second;
+    if (container.script)
+    {
+        send_error_response(request.seq, request.command, "A Blueprint frame's values can't be changed yet.");
+        return;
+    }
 
     // A struct-field container assigns through the symbol group by the field's full
     // access path (e.g. "t.origin.x"), which the engine resolves and writes with

@@ -67,6 +67,8 @@ class dap_server : public protocol::dap_service
     void handle_exception_info_request(const protocol::ExceptionInfoRequest &request) override;
     void handle_data_breakpoint_info_request(const protocol::DataBreakpointInfoRequest &request) override;
     void handle_set_data_breakpoints_request(const protocol::SetDataBreakpointsRequest &request) override;
+    void handle_goto_targets_request(const protocol::GotoTargetsRequest &request) override;
+    void handle_goto_request(const protocol::GotoRequest &request) override;
 
   public:
     // ---- Test seams ---------------------------------------------------------
@@ -252,6 +254,9 @@ class dap_server : public protocol::dap_service
         int thread_id = 0;
         std::uint32_t frame_number = 0;
         std::optional<debugger::source_location> source;
+        // A Blueprint frame's FFrame; frame_number is then the engine frame
+        // that runs it.
+        std::uint64_t script_frame = 0;
     };
     struct variable_container_context
     {
@@ -263,6 +268,9 @@ class dap_server : public protocol::dap_service
         std::string lazy_expression;
         std::string lazy_evaluate_name;
         bool resolved = true;
+        // Under a Blueprint frame: read from its FFrame, not the engine frame's
+        // scope, so nothing in it can be assigned through that scope.
+        bool script = false;
     };
     int create_lazy_variables_reference(const frame_context &context, const std::string &expression,
                                         const std::string &evaluate_name);
@@ -376,6 +384,15 @@ class dap_server : public protocol::dap_service
     std::optional<pending_stopped_event> pending_stopped_event_;
 
     std::map<int, frame_context> frame_contexts_;
+    // gotoTargets answers, until the next resume: the thread they were
+    // resolved on, and where each one goes.
+    struct goto_target_context
+    {
+        int thread_id = 0;
+        debugger::goto_target target;
+    };
+    std::map<int, goto_target_context> goto_targets_;
+    int next_goto_target_id_ = 1;
     int next_variables_reference_ = 1;
     std::map<int, variable_container_context> variables_by_reference_;
 
