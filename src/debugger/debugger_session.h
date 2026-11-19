@@ -94,6 +94,12 @@ class debugger_session
     std::vector<source_breakpoint_result> set_data_breakpoints(const std::vector<data_breakpoint_spec> &breakpoints);
     // Break on first-chance C++ exceptions (sxe/sxd e06d7363).
     void set_cpp_first_chance_break(bool enabled);
+    // Stop on a __debugbreak in the program's own code (Unreal's ensure()).
+    // Off: such a break goes back to the program, which runs on past it.
+    void set_ensure_break(bool enabled)
+    {
+        ensure_break_ = enabled;
+    }
     std::vector<breakpoint_state> get_breakpoint_states();
     void clear_all_breakpoints();
 
@@ -308,6 +314,15 @@ class debugger_session
     // Mirrors the sxe/sxd e06d7363 filter so the exception callback lets
     // first-chance C++ exceptions run when the filter is off.
     bool cpp_first_chance_break_ = false;
+    std::atomic<bool> ensure_break_{true};
+    // "Paused on an ensure() failure: Expr (File.cpp:N)." for a __debugbreak
+    // in the program's own code, from Unreal's own message or the call just
+    // before the break; else "Paused on a __debugbreak in X".
+    std::string describe_code_break(ULONG64 address);
+    // Unreal's last "Ensure condition failed: ..." line from the program's
+    // debugger output, and when it came.
+    std::string last_ensure_message_;
+    std::chrono::steady_clock::time_point last_ensure_message_time_;
     // Armed by interrupt() (a pause, or a break-in to apply breakpoints while
     // running), cleared by every resume. A break in ntdll!DbgBreakPoint stops
     // only while armed; one trailing after a resume is the injected break-in

@@ -4,9 +4,11 @@ namespace dap_dbgeng::service
 {
 void dap_server::handle_set_exception_breakpoints_request(const protocol::SetExceptionBreakpointsRequest &request)
 {
-    // The single advertised filter is "cpp" (break on first-chance C++
-    // exceptions); anything else is unknown and reported unverified.
+    // The advertised filters are "cpp" (break on first-chance C++ exceptions)
+    // and "ensure" (break on a __debugbreak in the program's code); anything
+    // else is unknown and reported unverified.
     bool cpp_enabled = false;
+    bool ensure_enabled = false;
     std::vector<protocol::Breakpoint> breakpoints;
     breakpoints.reserve(request.arguments.filters.size());
     for (const std::string &filter : request.arguments.filters)
@@ -15,6 +17,11 @@ void dap_server::handle_set_exception_breakpoints_request(const protocol::SetExc
         if (filter == "cpp")
         {
             cpp_enabled = true;
+            breakpoint.verified = true;
+        }
+        else if (filter == "ensure")
+        {
+            ensure_enabled = true;
             breakpoint.verified = true;
         }
         else
@@ -41,6 +48,7 @@ void dap_server::handle_set_exception_breakpoints_request(const protocol::SetExc
         const auto apply = [&]() {
             dispatcher_.invoke([&]() {
                 session.set_cpp_first_chance_break(cpp_enabled);
+                session.set_ensure_break(ensure_enabled);
                 return 0;
             });
         };

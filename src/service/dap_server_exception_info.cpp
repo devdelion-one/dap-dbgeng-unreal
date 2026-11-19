@@ -56,7 +56,8 @@ void dap_server::handle_exception_info_request(const protocol::ExceptionInfoRequ
 
         protocol::ExceptionInfoResponse response;
         response.body.exception_id = fmt::format("0x{:08X}", exception->code);
-        response.body.description = describe_exception_code(exception->code);
+        response.body.description =
+            exception->description.empty() ? describe_exception_code(exception->code) : exception->description;
         response.body.break_mode =
             exception->first_chance ? protocol::ExceptionBreakMode::Always : protocol::ExceptionBreakMode::Unhandled;
         protocol::ExceptionDetails details;

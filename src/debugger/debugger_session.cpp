@@ -108,29 +108,49 @@ class debugger_session::event_callbacks : public IDebugEventCallbacks
         // The break-in thread a process attach injects lands in
         // ntdll!DbgBreakPoint; the attach stop is already reported, so a late
         // second one is noise. A __debugbreak in the program's own code (an
-        // Unreal ensure(), say) is elsewhere and still stops.
-        if (exception->ExceptionCode == 0x80000003u)
-        {
-            ULONG64 dbg_break = 0;
-            const HRESULT found = owner_->symbols_ != nullptr
-                                      ? owner_->symbols_->GetOffsetByName("ntdll!DbgBreakPoint", &dbg_break)
-                                      : E_FAIL;
-            spdlog::debug("break exception at 0x{:x} first={} DbgBreakPoint=0x{:x} (hr 0x{:08x}) attach_pending={} expect={}",
-                         exception->ExceptionAddress, first_chance, dbg_break, static_cast<std::uint32_t>(found),
-                         owner_->attach_break_pending_.load(), owner_->expect_break_in_.load());
-        }
+        // Unreal ensure(), say) is elsewhere, and stops while the "ensure"
+        // filter is on.
         if (exception->ExceptionCode == 0x80000003u && first_chance != 0 && owner_->attach_break_pending_.exchange(false))
         {
             return DEBUG_STATUS_BREAK;
         }
+        std::string description;
         if (exception->ExceptionCode == 0x80000003u && first_chance != 0 && owner_->symbols_ != nullptr)
         {
             ULONG64 break_point = 0;
-            if (SUCCEEDED(owner_->symbols_->GetOffsetByName("ntdll!DbgBreakPoint", &break_point)) &&
-                break_point != 0 && exception->ExceptionAddress == break_point &&
-                !owner_->expect_break_in_.exchange(false))
+            const bool at_break_point = SUCCEEDED(owner_->symbols_->GetOffsetByName("ntdll!DbgBreakPoint", &break_point)) &&
+                                        break_point != 0 && exception->ExceptionAddress == break_point;
+            if (at_break_point && !owner_->expect_break_in_.exchange(false))
             {
                 return DEBUG_STATUS_GO_HANDLED;
+            }
+            // A __debugbreak in the program's own code (not ntdll's, where the
+            // loader's first break and break-ins live): Unreal's ensure().
+            // The adapter's own breakpoints arrive as Breakpoint events, never
+            // here.
+            if (!at_break_point && !owner_->is_kernel_)
+            {
+                ULONG module_index = 0;
+                ULONG64 module_base = 0;
+                char module_name[256] = {};
+                ULONG name_size = 0;
+                const bool in_ntdll =
+                    FAILED(owner_->symbols_->GetModuleByOffset(exception->ExceptionAddress, 0, &module_index,
+                                                               &module_base)) ||
+                    (SUCCEEDED(owner_->symbols_->GetModuleNames(module_index, 0, nullptr, 0, nullptr, module_name,
+                                                                sizeof(module_name), &name_size, nullptr, 0,
+                                                                nullptr)) &&
+                     _stricmp(module_name, "ntdll") == 0);
+                if (!in_ntdll)
+                {
+                    if (!owner_->ensure_break_.load())
+                    {
+                        spdlog::debug("passing over a __debugbreak at 0x{:x} (the ensure filter is off)",
+                                      exception->ExceptionAddress);
+                        return DEBUG_STATUS_GO_HANDLED;
+                    }
+                    description = owner_->describe_code_break(exception->ExceptionAddress);
+                }
             }
         }
         // Any other first-chance exception goes back to the program, which may
@@ -147,7 +167,7 @@ class debugger_session::event_callbacks : public IDebugEventCallbacks
         // stop. Set on the dispatcher thread (inside WaitForEvent), read
         // there too via dispatcher-marshaled calls; resuming clears it.
         owner_->last_exception_ =
-            last_exception_info{exception->ExceptionCode, exception->ExceptionAddress, first_chance != 0};
+            last_exception_info{exception->ExceptionCode, exception->ExceptionAddress, first_chance != 0, description};
         if (owner_->on_exception_hit)
         {
             owner_->on_exception_hit(static_cast<int>(exception->ExceptionCode));
@@ -417,7 +437,8 @@ debugger_session::debugger_session(const std::string &engine_path)
     }
     base_client->Release();
     check_hr(hr, "Could not query the debug engine interfaces");
-    unreal_reader_ = std::make_unique<unreal_reader>(symbols_, data_spaces_, control_);
+    unreal_reader_ =
+        std::make_unique<unreal_reader>(symbols_, data_spaces_, control_, system_objects_, dbghelp_module_);
 
     event_callbacks_ = new event_callbacks(this);   // ref count starts at 1
     output_callbacks_ = new output_callbacks(this); // ref count starts at 1

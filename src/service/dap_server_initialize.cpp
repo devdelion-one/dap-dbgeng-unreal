@@ -41,7 +41,15 @@ void dap_server::handle_initialize_request(const protocol::InitializeRequest &re
     cpp_filter.label = "C++ exceptions";
     cpp_filter.description = "Break when a C++ exception is thrown (first chance).";
     cpp_filter.default_ = false;
-    capabilities.exception_breakpoint_filters = std::vector<protocol::ExceptionBreakpointsFilter>{cpp_filter};
+    // Unreal's ensure() is a __debugbreak in the program's own code while a
+    // debugger is attached; on by default, as in Visual Studio.
+    protocol::ExceptionBreakpointsFilter ensure_filter;
+    ensure_filter.filter = "ensure";
+    ensure_filter.label = "ensure() failures";
+    ensure_filter.description = "Break on a __debugbreak in the program's own code, such as a failed Unreal ensure().";
+    ensure_filter.default_ = true;
+    capabilities.exception_breakpoint_filters =
+        std::vector<protocol::ExceptionBreakpointsFilter>{cpp_filter, ensure_filter};
     // Note: SupportsVariablePaging exists only on the client InitializeRequestArguments in this
     // generated model, not on the server Capabilities struct (it is a client capability in the DAP
     // schema), so it is not advertised here. Behavior is unaffected (replay ignores the caps body)

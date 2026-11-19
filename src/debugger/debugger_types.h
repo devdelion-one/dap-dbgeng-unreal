@@ -87,6 +87,8 @@ struct last_exception_info
     std::uint32_t code = 0;
     std::uint64_t address = 0;
     bool first_chance = false;
+    // What the stop was, when more is known than the code (an ensure()).
+    std::string description;
 };
 
 // One requested data (hardware) breakpoint: an address, a byte size (1/2/4/8),

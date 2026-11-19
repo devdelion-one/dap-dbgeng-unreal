@@ -526,9 +526,12 @@ void dap_server::wire_debugger_session(debugger::debugger_session &session)
         // kernel mode the break-in surfaces as a 0x80000003 exception.
         if (!has_pending_stopped_event())
         {
+            const auto last = self->get_last_exception();
             set_pending_stopped_event(
                 protocol::StoppedEventBodyReason::Exception,
-                fmt::format("Paused on exception 0x{:08X}.", static_cast<std::uint32_t>(exception_code)));
+                last.has_value() && !last->description.empty()
+                    ? last->description
+                    : fmt::format("Paused on exception 0x{:08X}.", static_cast<std::uint32_t>(exception_code)));
         }
     };
 

@@ -13,9 +13,14 @@
 > - **A sturdier event loop.** It survives a failed wait, a continue right after a step, and stray engine breaks.
 > - **Fast locals** (one read per level; lazy children), **hover** (locals and `this` members only, never a command),
 >   and **thread names** from Windows.
-> - **Unreal types read from memory** with the program's own PDB layouts: `FName`, `FString`, `TArray` items,
->   `UObject*` / `TObjectPtr` as "Name (Class)", `FGuid`, soft object paths, gameplay tags, `TMap`/`TSet` counts and
->   small number structs.
+> - **Unreal types read from memory** with the program's own PDB layouts: `FName`, `FString`, `FText`, `TArray`
+>   items, `TMap` items as `[Key] = Value` and `TSet` items (read when opened), `UObject*` / `TObjectPtr` /
+>   `TWeakObjectPtr` as "Name (Class)" (a dead weak pointer as `stale`), `TSharedPtr` / `TSharedRef` /
+>   `TUniquePtr` (opening onto the object's real class, from its vtable), `TOptional`, `FGuid`, soft object paths,
+>   gameplay tags and small number structs. A type's members are read once through dbghelp, since dbgeng takes up to
+>   half a second per member query on a big template.
+> - **An "ensure() failures" exception filter** (on by default). Off, a `__debugbreak` in the program's own code
+>   (Unreal's `ensure()`) is passed over and the program runs on. On, the stop says which ensure failed.
 >
 > Releases here hold `dap-dbgeng.exe` and `LICENSE` only. It needs Microsoft's `dbgeng.dll`, `dbgmodel.dll`,
 > `dbghelp.dll`, `dbgcore.dll` and `msdia140.dll` next to it, from the

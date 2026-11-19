@@ -116,6 +116,17 @@ void debugger_session::handle_output_received(const std::string &text)
         {
             output_capture_->append(text);
         }
+        // Unreal prints this right before an ensure() breaks.
+        constexpr std::string_view kEnsure = "Ensure condition failed: ";
+        const auto at = text.find(kEnsure);
+        if (at != std::string::npos)
+        {
+            std::string message = text.substr(at);
+            std::replace(message.begin(), message.end(), '\r', ' ');
+            std::replace(message.begin(), message.end(), '\n', ' ');
+            last_ensure_message_ = message.substr(0, 1024);
+            last_ensure_message_time_ = std::chrono::steady_clock::now();
+        }
         should_forward = output_capture_ == nullptr || !suppress_captured_output_forwarding_;
     }
 

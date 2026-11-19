@@ -335,9 +335,6 @@ std::vector<variable_node> debugger_session::get_locals_tree(std::uint32_t frame
         (void)expanded_any;
     }
 
-    const auto t_phase2 = std::chrono::steady_clock::now();
-    long long t_reader_us = 0;
-    long long t_read_us = 0;
     std::size_t node_count = 0;
     // Phase 2: read the now-stable flat list and rebuild the tree via ParentSymbol.
     std::vector<variable_node> roots;
@@ -350,11 +347,9 @@ std::vector<variable_node> debugger_session::get_locals_tree(std::uint32_t frame
             std::vector<variable_node> nodes(count);
             for (ULONG i = 0; i < count; ++i)
             {
-                const auto t0 = std::chrono::steady_clock::now();
                 nodes[i].name = read_symbol_name(group, i);
                 nodes[i].value = normalize_value_text(read_symbol_value(group, i));
                 nodes[i].type = read_symbol_type(group, i);
-                const auto t1 = std::chrono::steady_clock::now();
                 // The fields inside a value already shown as an object pointer
                 // (DebugPtr, Handle...) are dropped; don't read them.
                 const ULONG parent = params[i].ParentSymbol;
@@ -365,15 +360,6 @@ std::vector<variable_node> debugger_session::get_locals_tree(std::uint32_t frame
                 {
                     apply_unreal_view(group, i, nodes[i], /*summarize=*/false);
                 }
-                const auto t2 = std::chrono::steady_clock::now();
-                if (std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() > 20)
-                {
-                    spdlog::debug("slow reader node {} ms: {} [{}]",
-                                  std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count(), nodes[i].name,
-                                  nodes[i].type);
-                }
-                t_read_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
-                t_reader_us += std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
                 ++node_count;
                 // Expandable but not inlined (depth/budget cap or pointer): leave
                 // children empty so the caller can still flag it if it wants.
@@ -414,17 +400,15 @@ std::vector<variable_node> debugger_session::get_locals_tree(std::uint32_t frame
     }
 
     group->Release();
-    const auto t_expand = std::chrono::steady_clock::now();
     for (auto &root : roots)
     {
         expand_reader_children(root);
     }
     tidy_tree(roots);
-    const auto t_done = std::chrono::steady_clock::now();
-    spdlog::debug("locals tree: expand {} ms, {} nodes, engine read {} ms, reader {} ms, children+tidy {} ms",
-                  std::chrono::duration_cast<std::chrono::milliseconds>(t_phase2 - t_frame_start).count(), node_count,
-                  t_read_us / 1000, t_reader_us / 1000,
-                  std::chrono::duration_cast<std::chrono::milliseconds>(t_done - t_expand).count());
+    spdlog::debug("locals tree: {} nodes in {} ms", node_count,
+                  std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+                                                                        t_frame_start)
+                      .count());
     return roots;
 }
 
@@ -444,7 +428,8 @@ void debugger_session::apply_unreal_view(IDebugSymbolGroup2 *group, ULONG index,
     {
         address = 0;
     }
-    const auto view = unreal_reader_->view(node.type, entry.ModuleBase, entry.TypeId, address, node.value);
+    const auto view =
+        unreal_reader_->view(node.type, entry.ModuleBase, entry.TypeId, address, node.value, /*with_children=*/false);
     if (!view.has_value())
     {
         const bool aggregate_text = node.value.rfind("struct ", 0) == 0 || node.value.rfind("class ", 0) == 0;
@@ -462,13 +447,23 @@ void debugger_session::apply_unreal_view(IDebugSymbolGroup2 *group, ULONG index,
     {
         node.lazy_expression = view->expand_expression;
     }
+    if (view->replaces_children && view->lazy_children)
+    {
+        // Read only when opened (a map's items).
+        if (address != 0)
+        {
+            node.lazy_expression =
+                unreal_reader::reader_expression(entry.ModuleBase, entry.TypeId, address, node.type);
+        }
+        return;
+    }
     if (view->replaces_children)
     {
         node.reader_replaces = true;
         node.reader_children = view->children;
         if (address != 0)
         {
-            node.lazy_expression = unreal_reader_->typed_expression(entry.ModuleBase, node.type, address);
+            node.lazy_expression = unreal_reader::reader_expression(entry.ModuleBase, entry.TypeId, address, node.type);
         }
     }
 }
@@ -484,7 +479,8 @@ variable_node debugger_session::node_from_reader_child(const unreal_child &child
         node.value = *plain;
         return node;
     }
-    const auto view = unreal_reader_->view(child.type, child.module_base, child.type_id, child.address, "");
+    const auto view =
+        unreal_reader_->view(child.type, child.module_base, child.type_id, child.address, "", /*with_children=*/false);
     if (view.has_value())
     {
         node.value = view->display;
@@ -497,13 +493,20 @@ variable_node debugger_session::node_from_reader_child(const unreal_child &child
             node.lazy_expression = child.expression;
         }
     }
+    else if (!child.type.empty() && child.type.back() == '*')
+    {
+        // A plain pointer item: its address, opening onto what it points to.
+        node.value = unreal_reader_->brief(child.module_base, child.type, child.type_id, child.address);
+        const auto pointer = unreal_reader_->pointer_at(child.address);
+        if (pointer && *pointer != 0)
+        {
+            node.lazy_expression = unreal_reader_->pointee_expression(child.module_base, child.type, *pointer);
+        }
+    }
     else
     {
         node.value = unreal_reader_->summary(child.module_base, child.type_id, child.address).value_or("{...}");
-        if (child.type.empty() || child.type.back() != '*')
-        {
-            node.lazy_expression = child.expression;
-        }
+        node.lazy_expression = child.expression;
     }
     node.is_expandable = !node.lazy_expression.empty();
     return node;
@@ -551,25 +554,60 @@ std::vector<variable_node> debugger_session::expand_expression(std::uint32_t fra
     throw_if_disposed();
     const bool raw = expression_text.rfind("raw:", 0) == 0;
     const std::string expression = raw ? expression_text.substr(4) : expression_text;
+    if (const auto target = unreal_reader::parse_reader_expression(expression))
+    {
+        // A value the reader opens itself, no engine expression involved; its
+        // raw members are an ordinary typed expression, parsed only if opened.
+        const std::string typed = unreal_reader_ != nullptr
+                                      ? unreal_reader_->typed_expression(target->module_base, target->type,
+                                                                         target->address)
+                                      : std::string();
+        if (raw || unreal_reader_ == nullptr)
+        {
+            // The container's own fields, from its layout: no expression for
+            // dbgeng to parse.
+            if (unreal_reader_ != nullptr)
+            {
+                if (const auto fields = unreal_reader_->members(target->module_base, target->type_id, target->address))
+                {
+                    std::vector<variable_node> out;
+                    for (const auto &child : *fields)
+                    {
+                        out.push_back(node_from_reader_child(child));
+                    }
+                    return out;
+                }
+            }
+            return expand_expression(frame_number, "raw:" + typed);
+        }
+        const auto view = unreal_reader_->view(target->type, target->module_base, target->type_id, target->address, "");
+        std::vector<variable_node> out;
+        if (view.has_value() && view->replaces_children)
+        {
+            for (const auto &child : view->children)
+            {
+                out.push_back(node_from_reader_child(child));
+            }
+            variable_node raw_view;
+            raw_view.name = "[Raw View]";
+            raw_view.type = target->type;
+            raw_view.lazy_expression = "raw:" + expression;
+            raw_view.is_expandable = true;
+            out.push_back(std::move(raw_view));
+            return out;
+        }
+        if (view.has_value() && !view->expand_expression.empty())
+        {
+            return expand_expression(frame_number, view->expand_expression);
+        }
+        return expand_expression(frame_number, typed);
+    }
 
     // `*(Module!Type *)0x...` needs no frame: an empty group is far cheaper than
     // the frame's whole scope group.
     const bool absolute = expression.rfind("*(", 0) == 0 && expression.find(")0x") != std::string::npos;
     ULONG index = DEBUG_ANY_ID;
     IDebugSymbolGroup2 *group = nullptr;
-    const auto t_start = std::chrono::steady_clock::now();
-    const auto ms_since = [&]() {
-        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_start).count();
-    };
-    struct timing_log
-    {
-        std::function<long long()> f;
-        std::string e;
-        ~timing_log()
-        {
-            spdlog::debug("expand_expression {} ms: {}", f(), e);
-        }
-    } timing{ms_since, expression};
     if (absolute)
     {
         if (FAILED(symbols_->CreateSymbolGroup2(&group)) || group == nullptr)
@@ -577,7 +615,6 @@ std::vector<variable_node> debugger_session::expand_expression(std::uint32_t fra
             throw std::runtime_error("Could not create a symbol group.");
         }
         const HRESULT added = group->AddSymbol(expression.c_str(), &index);
-        spdlog::debug("expand_expression AddSymbol {} ms", ms_since());
         if (FAILED(added) || index == DEBUG_ANY_ID)
         {
             group->Release();
@@ -668,8 +705,10 @@ std::vector<variable_node> debugger_session::expand_expression(std::uint32_t fra
         apply_unreal_view(group, i, child);
         child.reader_children.clear();
         child.reader_replaces = false;
+        // A vtable's slots (__vfptr) are function pointers, and dbgeng takes
+        // seconds to fail on their array type: not worth opening.
         if (child.lazy_expression.empty() && children[i].SubElements != 0 && child_address != 0 &&
-            !type_is_pointer(child.type) && unreal_reader_ != nullptr)
+            !type_is_pointer(child.type) && child.name != "__vfptr" && unreal_reader_ != nullptr)
         {
             DEBUG_SYMBOL_ENTRY entry{};
             if (SUCCEEDED(group->GetSymbolEntryInformation(i, &entry)))
@@ -1008,6 +1047,101 @@ std::optional<std::string> debugger_session::try_get_frame_name(std::uint64_t in
         return std::nullopt;
     }
     return displacement == 0 ? name : fmt::format("{}+0x{:X}", name, displacement);
+}
+
+std::string debugger_session::describe_code_break(ULONG64 address)
+{
+    // An Unreal ensure() prints "Ensure condition failed: Expr [File:F]
+    // [Line: N]" to the debugger, then breaks. The break itself sits in a tiny
+    // lambda the linker folds with every other one, so its symbol and line
+    // name some unrelated ensure; the message names the real one.
+    std::string message;
+    {
+        std::lock_guard<std::mutex> lock(output_capture_sync_);
+        if (!last_ensure_message_.empty() &&
+            std::chrono::steady_clock::now() - last_ensure_message_time_ < std::chrono::seconds(30))
+        {
+            message = last_ensure_message_;
+        }
+        last_ensure_message_.clear();
+    }
+    std::string where = try_get_frame_name(address).value_or(fmt::format("0x{:x}", address));
+    bool ensure = !message.empty();
+
+    // Without the message: the call just before the break is
+    // ExecCheckImplInternal (ensure) or EnsureFailed (ensureMsgf).
+    if (!ensure)
+    {
+        std::array<unsigned char, 48> code{};
+        ULONG done = 0;
+        if (SUCCEEDED(data_spaces_->ReadVirtual(address - code.size(), code.data(), static_cast<ULONG>(code.size()),
+                                                &done)) &&
+            done == code.size())
+        {
+            const ULONG64 start = address - code.size();
+            for (std::size_t at = 0; at + 5 <= code.size() && !ensure; ++at)
+            {
+                std::optional<ULONG64> target;
+                if (code[at] == 0xE8)
+                {
+                    std::int32_t relative = 0;
+                    std::memcpy(&relative, &code[at + 1], sizeof(relative));
+                    target = start + at + 5 + static_cast<ULONG64>(static_cast<std::int64_t>(relative));
+                }
+                else if (code[at] == 0xFF && at + 6 <= code.size() && code[at + 1] == 0x15)
+                {
+                    // call qword ptr [rip+disp]: an import from Core's DLL.
+                    std::int32_t relative = 0;
+                    std::memcpy(&relative, &code[at + 2], sizeof(relative));
+                    ULONG64 slot = start + at + 6 + static_cast<ULONG64>(static_cast<std::int64_t>(relative));
+                    ULONG64 pointer = 0;
+                    if (SUCCEEDED(data_spaces_->ReadVirtual(slot, &pointer, sizeof(pointer), &done)) &&
+                        done == sizeof(pointer))
+                    {
+                        target = pointer;
+                    }
+                }
+                if (target)
+                {
+                    const std::string name = try_get_frame_name(*target).value_or("");
+                    ensure = name.find("ExecCheckImplInternal") != std::string::npos ||
+                             name.find("EnsureFailed") != std::string::npos;
+                }
+            }
+        }
+    }
+    std::string place;
+    if (const auto source = try_get_frame_source(address))
+    {
+        place = fmt::format(" ({}:{})", std::filesystem::path(source->path).filename().string(), source->line);
+    }
+    if (!message.empty())
+    {
+        // "0 [File:D:\...\UnrealEngine.cpp] [Line: 11355]" -> "0 (UnrealEngine.cpp:11355)".
+        std::string text = message.substr(std::strlen("Ensure condition failed: "));
+        const auto file_at = text.find(" [File:");
+        const auto line_at = text.find("] [Line: ");
+        if (file_at != std::string::npos && line_at != std::string::npos && line_at > file_at)
+        {
+            const std::string file = text.substr(file_at + 7, line_at - file_at - 7);
+            const auto line_end = text.find(']', line_at + 9);
+            const std::string line = text.substr(line_at + 9, line_end == std::string::npos ? std::string::npos
+                                                                                           : line_end - line_at - 9);
+            std::string rest = line_end == std::string::npos ? std::string() : trim_both(text.substr(line_end + 1));
+            text = fmt::format("{} ({}:{})", trim_both(text.substr(0, file_at)),
+                               std::filesystem::path(file).filename().string(), trim_both(line));
+            if (!rest.empty())
+            {
+                text += " " + rest.substr(0, 200);
+            }
+        }
+        return fmt::format("Paused on an ensure() failure: {}.", text);
+    }
+    if (ensure)
+    {
+        return fmt::format("Paused on an ensure() failure in {}{}.", where, place);
+    }
+    return fmt::format("Paused on a __debugbreak in {}{}.", where, place);
 }
 
 bool debugger_session::try_get_symbol_start(std::uint64_t instruction_offset, std::uint64_t &symbol_start)
